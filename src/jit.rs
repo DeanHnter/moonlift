@@ -65,6 +65,8 @@ impl JIT {
             int,
             builder,
             locals: HashMap::new(),
+            scopes: Vec::new(),
+            next_var: 0,
             module: &mut self.module,
             string_counter: 0,
             globals: &mut self.global_data,
@@ -110,7 +112,9 @@ impl Default for JIT {
 struct Translator<'a> {
     int: types::Type,
     builder: FunctionBuilder<'a>,
-    locals: HashMap<String, Variable>,
+    locals: HashMap<String, Vec<Variable>>,
+    scopes: Vec<Vec<String>>,
+    next_var: usize,
     module: &'a mut JITModule,
     string_counter: usize,
     globals: &'a mut HashMap<String, DataId>,
@@ -154,17 +158,21 @@ impl Translator<'_> {
                     
                     self.builder.switch_to_block(then_block);
                     self.builder.seal_block(then_block);
+                    self.enter_scope();
                     for stmt in block {
                         self.translate_statement(stmt);
                     }
+                    self.exit_scope();
                     self.builder.ins().jump(merge_block, &[]);
                     self.builder.switch_to_block(else_block);
                     self.builder.seal_block(else_block);
                 }
                 
+                self.enter_scope();
                 for stmt in elsecase {
                     self.translate_statement(stmt);
                 }
+                self.exit_scope();
                 
                 self.builder.ins().jump(merge_block, &[]);
                 self.builder.switch_to_block(merge_block);
@@ -186,9 +194,11 @@ impl Translator<'_> {
                 
                 self.builder.switch_to_block(body_block);
                 self.builder.seal_block(body_block);
+                self.enter_scope();
                 for stmt in block {
                     self.translate_statement(stmt);
                 }
+                self.exit_scope();
                 self.builder.ins().jump(header_block, &[]);
                 self.builder.switch_to_block(exit_block);
                 self.builder.seal_block(header_block); 
@@ -202,9 +212,11 @@ impl Translator<'_> {
                 let exit_block = self.builder.create_block();
                 self.builder.ins().jump(body_block, &[]);
                 self.builder.switch_to_block(body_block); 
+                self.enter_scope();
                 for stmt in block {
                     self.translate_statement(stmt);
                 }
+                self.exit_scope();
                 let cond_value = self.translate_expr(cond);
                 self.builder
                     .ins()
@@ -231,8 +243,8 @@ impl Translator<'_> {
                 for (var, val) in vars.iter().zip(values.into_iter()) {
                     match var {
                         Expression::Var(name) => {
-                            if let Some(var) = self.locals.get(name) {
-                                self.builder.def_var(*var, val);
+                            if let Some(stack) = self.locals.get(name) {
+                                self.builder.def_var(*stack.last().unwrap(), val);
                             } else {
                                 let data_id = self.declare_global(name, None);
                                 
@@ -303,9 +315,11 @@ impl Translator<'_> {
                 self.translate_function_call(call);
             }
             Statement::Do(block) => {
+                self.enter_scope();
                 for stmt in block {
                     self.translate_statement(stmt);
                 }
+                self.exit_scope();
             }
             Statement::Function { ref name, ref params, ref body } => {
                 let func_name = name.qname.join(".");
@@ -330,6 +344,8 @@ impl Translator<'_> {
                         int: self.int,
                         builder,
                         locals: HashMap::new(),
+                        scopes: vec![Vec::new()],
+                        next_var: 0,
                         module: self.module,
                         string_counter: self.string_counter,
                         globals: self.globals,
@@ -392,8 +408,12 @@ impl Translator<'_> {
                 Number::Float(f) => self.builder.ins().iconst(self.int, *f as i64),
             },
             Expression::Var(name) => {   
-                if let Some(var) = self.locals.get(name) {
-                    self.builder.use_var(*var)
+                if let Some(stack) = self.locals.get(name) {
+                    if let Some(&var) = stack.last() {
+                        self.builder.use_var(var)
+                    } else {
+                        self.builder.ins().iconst(self.int, 0)
+                    }
                 } else {
                     self.builder.ins().iconst(self.int, 0)
                 }
@@ -582,6 +602,8 @@ impl Translator<'_> {
                         int: self.int,
                         builder,
                         locals: HashMap::new(),
+                        scopes: vec![Vec::new()],
+                        next_var: 0,
                         module: self.module,
                         string_counter: self.string_counter,
                         globals: self.globals,
@@ -614,11 +636,32 @@ impl Translator<'_> {
             _ => todo!("Unsupported expression {expr:?}"),
         }
     }
+    fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn exit_scope(&mut self) {
+        if let Some(vars) = self.scopes.pop() {
+            for name in vars {
+                if let Some(stack) = self.locals.get_mut(&name) {
+                    stack.pop();
+                    if stack.is_empty() {
+                        self.locals.remove(&name);
+                    }
+                }
+            }
+        }
+    }
+
     fn declare_local(&mut self, name: &str) -> Variable {
-        assert!(!self.locals.contains_key(name));
-        let idx = self.locals.len();
-        let var = Variable::new(idx);
-        self.locals.insert(name.to_string(), var);
+        let var = Variable::new(self.next_var);
+        self.next_var += 1;
+        self.locals.entry(name.to_string()).or_default().push(var);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.push(name.to_string());
+        } else {
+            self.scopes.push(vec![name.to_string()]);
+        }
         self.builder.declare_var(var, self.int);
         var
     }
