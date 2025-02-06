@@ -389,7 +389,7 @@ impl Translator<'_> {
             Expression::Boolean(v) => self.builder.ins().iconst(self.int, if *v { 1 } else { 0 }),
             Expression::Number(v) => match v {
                 Number::Integer(i) => self.builder.ins().iconst(self.int, *i),
-                Number::Float(f) => self.builder.ins().f64const(*f),
+                Number::Float(f) => self.builder.ins().iconst(self.int, *f as i64),
             },
             Expression::Var(name) => {   
                 if let Some(var) = self.locals.get(name) {
@@ -403,7 +403,10 @@ impl Translator<'_> {
                 match op {
                     UnaryOp::Minus => self.builder.ins().ineg(val),
                     UnaryOp::BitNot => self.builder.ins().bnot(val),
-                    UnaryOp::Not => self.builder.ins().icmp_imm(IntCC::Equal, val, 0),
+                    UnaryOp::Not => {
+                        let cmp = self.builder.ins().icmp_imm(IntCC::Equal, val, 0);
+                        self.builder.ins().uextend(self.int, cmp)
+                    },
                     UnaryOp::Len => {
                         let mut sig = self.module.make_signature();
                         sig.params.push(AbiParam::new(self.int));
@@ -489,12 +492,30 @@ impl Translator<'_> {
                                     InfixOp::Div => self.builder.ins().sdiv(e, val),
                                     InfixOp::FloorDiv => self.builder.ins().udiv(e, val),
                                     InfixOp::Mod => self.builder.ins().srem(e, val),
-                                    InfixOp::Less => self.builder.ins().icmp(IntCC::SignedLessThan, e, val),
-                                    InfixOp::LessEq => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, e, val),
-                                    InfixOp::Greater => self.builder.ins().icmp(IntCC::SignedGreaterThan, e, val),
-                                    InfixOp::GreaterEq => self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, e, val),
-                                    InfixOp::Eq => self.builder.ins().icmp(IntCC::Equal, e, val),
-                                    InfixOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, e, val),
+                                    InfixOp::Less => {
+                                        let cmp = self.builder.ins().icmp(IntCC::SignedLessThan, e, val);
+                                        self.builder.ins().uextend(self.int, cmp)
+                                    },
+                                    InfixOp::LessEq => {
+                                        let cmp = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, e, val);
+                                        self.builder.ins().uextend(self.int, cmp)
+                                    },
+                                    InfixOp::Greater => {
+                                        let cmp = self.builder.ins().icmp(IntCC::SignedGreaterThan, e, val);
+                                        self.builder.ins().uextend(self.int, cmp)
+                                    },
+                                    InfixOp::GreaterEq => {
+                                        let cmp = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, e, val);
+                                        self.builder.ins().uextend(self.int, cmp)
+                                    },
+                                    InfixOp::Eq => {
+                                        let cmp = self.builder.ins().icmp(IntCC::Equal, e, val);
+                                        self.builder.ins().uextend(self.int, cmp)
+                                    },
+                                    InfixOp::NotEq => {
+                                        let cmp = self.builder.ins().icmp(IntCC::NotEqual, e, val);
+                                        self.builder.ins().uextend(self.int, cmp)
+                                    },
                                     _ => unreachable!("Unexpected operator"),
                                 }
                             }
