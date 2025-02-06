@@ -341,12 +341,13 @@ impl Translator<'_> {
                         let mut iter = values.into_iter();
                         let mut e = iter.next().unwrap();
                         if *op == InfixOp::Concat {
+                            // Declare the helper function once:
                             let mut sig = self.module.make_signature();
-                            sig.params.push(AbiParam::new(self.int));
-                            sig.params.push(AbiParam::new(self.int));
-                            sig.returns.push(AbiParam::new(self.int));
+                            sig.params.push(AbiParam::new(self.int)); // first string pointer
+                            sig.params.push(AbiParam::new(self.int)); // second string pointer
+                            sig.returns.push(AbiParam::new(self.int)); // pointer to the new string
                             let func_id = self.module
-                                .declare_function("concat", Linkage::Import, &sig)
+                                .declare_function("lua_concat", Linkage::Import, &sig)
                                 .expect("Failed to declare concatenation function");
                             let concat_callee = self.module.declare_func_in_func(func_id, self.builder.func);
                             for val in iter {
@@ -428,6 +429,20 @@ impl Translator<'_> {
                     }
                 }
                 self.builder.ins().iconst(self.int, 0)
+            }
+            Expression::Table(fields) => {
+                if !fields.is_empty() {
+                    todo!("Table with fields not yet implemented: {:?}", fields);
+                }
+                let mut sig = self.module.make_signature();
+                sig.returns.push(AbiParam::new(self.int));
+                let table_helper_id = self.module
+                    .declare_function("lua_newtable", Linkage::Import, &sig)
+                    .expect("Failed to declare newtable helper function");
+                let newtable_callee = self.module.declare_func_in_func(table_helper_id, self.builder.func);
+                let call = self.builder.ins().call(newtable_callee, &[]);
+                let table_ptr = self.builder.inst_results(call)[0];
+                table_ptr
             }
             _ => todo!("Unsupported expression {expr:?}"),
         }
