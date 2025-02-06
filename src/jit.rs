@@ -541,6 +541,55 @@ impl Translator<'_> {
                 let table_ptr = self.builder.inst_results(call)[0];
                 table_ptr
             }
+            Expression::FunctDef(params, body) => {
+                let lambda_name = format!("lambda_{}", self.string_counter);
+                self.string_counter += 1;
+                
+                let mut new_ctx = self.module.make_context();
+                for _ in &params.names {
+                    new_ctx.func.signature.params.push(AbiParam::new(self.int));
+                }
+                new_ctx.func.signature.returns.push(AbiParam::new(self.int));
+                let mut new_builder_context = FunctionBuilderContext::new();
+                {
+                    let mut builder = FunctionBuilder::new(&mut new_ctx.func, &mut new_builder_context);
+                    let entry_block = builder.create_block();
+                    builder.append_block_params_for_function_params(entry_block);
+                    builder.switch_to_block(entry_block);
+                    builder.seal_block(entry_block);
+                    let mut func_translator = Translator {
+                        int: self.int,
+                        builder,
+                        locals: HashMap::new(),
+                        module: self.module,
+                        string_counter: self.string_counter,
+                        globals: self.globals,
+                    };
+                    for (i, param_name) in params.names.iter().enumerate() {
+                        let val = func_translator.builder.block_params(entry_block)[i];
+                        let var = func_translator.declare_local(param_name);
+                        func_translator.builder.def_var(var, val);
+                    }
+                    for stmt in body {
+                        func_translator.translate_statement(stmt);
+                    }
+                    let default_ret = func_translator.builder.ins().iconst(self.int, 0);
+                    func_translator.builder.ins().return_(&[default_ret]);
+                    func_translator.builder.finalize();
+                    self.string_counter = func_translator.string_counter;
+                }
+                let func_id = self
+                    .module
+                    .declare_function(&lambda_name, Linkage::Local, &new_ctx.func.signature)
+                    .expect("Failed to declare lambda function");
+                self.module
+                    .define_function(func_id, &mut new_ctx)
+                    .expect("Failed to define lambda function");
+                self.module.clear_context(&mut new_ctx);
+                self.module.finalize_definitions().unwrap();
+                let fn_ptr = self.module.get_finalized_function(func_id);
+                self.builder.ins().iconst(self.int, fn_ptr as i64)
+            }
             _ => todo!("Unsupported expression {expr:?}"),
         }
     }
