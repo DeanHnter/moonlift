@@ -6,6 +6,7 @@ use parser::Parser;
 
 mod ast;
 pub mod jit;
+pub mod runtime;
 mod lexer;
 mod parser;
 
