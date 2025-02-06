@@ -4,7 +4,7 @@ use crate::Source;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module, DataId};
-use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat};
+use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat, lua_next};
 
 pub struct JIT {
     builder_context: FunctionBuilderContext,
@@ -31,6 +31,7 @@ impl JIT {
         builder.symbol("lua_newtable", lua_newtable as *const u8);
         builder.symbol("lua_settable", lua_settable as *const u8);
         builder.symbol("lua_concat", lua_concat as *const u8);
+        builder.symbol("lua_next", lua_next as *const u8);
         let module = JITModule::new(builder);
         let builder_context = FunctionBuilderContext::new();
         let ctx = module.make_context();
@@ -395,6 +396,76 @@ impl Translator<'_> {
                     let ins = self.builder.ins();
                     ins.store(MemFlags::trusted(), iconst_val, ptr, 0);
                 }
+            }
+            Statement::ForEach { vars, exprs, block } => {
+                if exprs.len() == 1 {
+                    if let Expression::FunctCall(call) = &exprs[0] {
+                        if let Expression::Var(func_name) = &call.prefix {
+                            if func_name == "pairs" {
+                                if let Some(table_expr) = call.args.get(0) {
+                                    let table_val = self.translate_expr(table_expr);
+                                    let initial_key = self.builder.ins().iconst(self.int, 0);
+                                    let iter_key_var = self.declare_local("iter_key_temp");
+                                    self.builder.def_var(iter_key_var, initial_key);
+                                    
+                                    let loop_header = self.builder.create_block();
+                                    let loop_body = self.builder.create_block();
+                                    let loop_exit = self.builder.create_block();
+                                    
+                                    self.builder.append_block_param(loop_body, self.int);
+                                    
+                                    self.builder.ins().jump(loop_header, &[]);
+                                    
+                                    self.builder.switch_to_block(loop_header);
+                                    self.builder.seal_block(loop_header);
+                                    
+                                    let current_key = self.builder.use_var(iter_key_var);
+                                    
+                                    let mut sig = self.module.make_signature();
+                                    sig.params.push(AbiParam::new(self.int));
+                                    sig.params.push(AbiParam::new(self.int));
+                                    sig.returns.push(AbiParam::new(self.int));
+                                    
+                                    let func_id = self.module
+                                        .declare_function("lua_next", Linkage::Import, &sig)
+                                        .expect("Failed to declare lua_next helper function");
+                                    let lua_next_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                                    
+                                    let call_inst = self.builder.ins().call(lua_next_callee, &[table_val, current_key]);
+                                    let next_key = self.builder.inst_results(call_inst)[0];
+                                    
+                                    let cmp = self.builder.ins().icmp_imm(IntCC::Equal, next_key, 0);
+                                    self.builder.ins().brif(cmp, loop_exit, &[], loop_body, &[next_key]);
+                                    
+                                    self.builder.switch_to_block(loop_body);
+                                    self.builder.seal_block(loop_body);
+                                    let loop_current_key = self.builder.block_params(loop_body)[0];
+                                    
+                                    if let Some(loop_var_name) = vars.get(0) {
+                                        let loop_var = self.declare_local(loop_var_name);
+                                        self.builder.def_var(loop_var, loop_current_key);
+                                    }
+                                    
+                                    self.enter_scope();
+                                    for stmt in block {
+                                        self.translate_statement(stmt);
+                                    }
+                                    self.exit_scope();
+                                    
+                                    self.builder.def_var(iter_key_var, loop_current_key);
+                                    
+                                    self.builder.ins().jump(loop_header, &[]);
+                                    
+                                    self.builder.switch_to_block(loop_exit);
+                                    self.builder.seal_block(loop_exit);
+                                    
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                todo!("ForEach not implemented for given expression");
             }
             _ => todo!("unimplemented {stmt:?}"),
         }
