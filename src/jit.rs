@@ -1,30 +1,19 @@
 use std::collections::HashMap;
-
-use crate::ast::{Expression, InfixOp, Number, Statement, UnaryOp};
+use crate::ast::{Expression, FunctionCall, InfixOp, Number, Statement, UnaryOp};
 use crate::Source;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
 
 pub struct JIT {
-    /// The function builder context, which is reused across multiple
-    /// FunctionBuilder instances.
     builder_context: FunctionBuilderContext,
-
-    /// The main Cranelift context, which holds the state for codegen. Cranelift
-    /// separates this from `Module` to allow for parallel compilation, with a
-    /// context per thread, though this isn't in the simple demo here.
     ctx: codegen::Context,
-
-    /// The data description, which is to data objects what `ctx` is to functions.
     data_description: DataDescription,
-
-    /// The module, with the jit backend, which manages the JIT'd
-    /// functions.
     module: JITModule,
 }
 
 impl JIT {
+
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -36,7 +25,6 @@ impl JIT {
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-
         let module = JITModule::new(builder);
         let builder_context = FunctionBuilderContext::new();
         let ctx = module.make_context();
@@ -50,35 +38,22 @@ impl JIT {
     }
 
     pub fn compile(&mut self, source: &Source) -> Result<(), String> {
-        // TODO: error handling
         self.compile_fn(&[], &source.block)?;
         Ok(())
     }
 
     fn compile_fn(&mut self, params: &[String], block: &[Statement]) -> Result<*const u8, String> {
         let int = self.module.target_config().pointer_type();
-
-        // define the signature (currently only int, and always return
+        
         for _ in params {
             self.ctx.func.signature.params.push(AbiParam::new(int));
         }
-        //self.ctx.func.signature.returns.push(AbiParam::new(int));
-
+        
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
         let entry_block = builder.create_block();
-
-        // Since this is the entry block, add block parameters corresponding to
-        // the function's parameters.
         builder.append_block_params_for_function_params(entry_block);
-
-        // Tell the builder to emit code in this block.
         builder.switch_to_block(entry_block);
-
-        // And, tell the builder that this block will have no further
-        // predecessors. Since it's the entry block, it won't have any
-        // predecessors.
         builder.seal_block(entry_block);
-
         let mut translator = Translator {
             int,
             builder,
@@ -86,44 +61,35 @@ impl JIT {
             module: &mut self.module,
             string_counter: 0,
         };
-
-        // declar variables for params
+        
         for (i, param) in params.iter().enumerate() {
             let val = translator.builder.block_params(entry_block)[i];
             let var = translator.declare_local(param);
             translator.builder.def_var(var, val);
         }
-
-        // now translate the statements
+        
         for stmt in block {
             translator.translate_statement(stmt);
         }
-
-        // TODO: return value
+    
         translator.builder.finalize();
-
-        ////////////////////////////////////////////////////////////
-        // declare the function
+        
         let id = self
             .module
             .declare_function("main", Linkage::Export, &self.ctx.func.signature)
             .map_err(|e| e.to_string())?;
-        // define the function
+        
         self.module
             .define_function(id, &mut self.ctx)
             .map_err(|e| e.to_string())?;
-
-        // compilation finished for the function, we can clear the context.
+        
         self.module.clear_context(&mut self.ctx);
-
-        // Finalize the functions which we just defined, which resolves any
-        // outstanding relocations (patching in addresses, now that they're
-        // available).
+        
+        
+        
         self.module.finalize_definitions().unwrap();
-
-        // We can now retrieve a pointer to the machine code.
+        
         let code = self.module.get_finalized_function(id);
-
         Ok(code)
     }
 }
@@ -133,7 +99,6 @@ impl Default for JIT {
         Self::new()
     }
 }
-
 struct Translator<'a> {
     int: types::Type,
     builder: FunctionBuilder<'a>,
@@ -141,7 +106,6 @@ struct Translator<'a> {
     module: &'a mut JITModule,
     string_counter: usize,
 }
-
 impl Translator<'_> {
     fn translate_statement(&mut self, stmt: &Statement) {
         match stmt {
@@ -154,34 +118,25 @@ impl Translator<'_> {
                     let cond_value = self.translate_expr(cond);
                     let then_block = self.builder.create_block();
                     let else_block = self.builder.create_block();
-
                     self.builder
                         .ins()
                         .brif(cond_value, then_block, &[], else_block, &[]);
-
-                    // fill the block
+                    
                     self.builder.switch_to_block(then_block);
                     self.builder.seal_block(then_block);
                     for stmt in block {
                         self.translate_statement(stmt);
                     }
-
-                    // jump to the merge-block
                     self.builder.ins().jump(merge_block, &[]);
-
-                    // now switch to the else-block
                     self.builder.switch_to_block(else_block);
                     self.builder.seal_block(else_block);
                 }
-
-                // handle the else block
+                
                 for stmt in elsecase {
                     self.translate_statement(stmt);
                 }
-
-                // jump to the merge-block
+                
                 self.builder.ins().jump(merge_block, &[]);
-                // now switch to the merge-block
                 self.builder.switch_to_block(merge_block);
                 self.builder.seal_block(merge_block);
             }
@@ -192,27 +147,21 @@ impl Translator<'_> {
                 let header_block = self.builder.create_block();
                 let body_block = self.builder.create_block();
                 let exit_block = self.builder.create_block();
-
                 self.builder.ins().jump(header_block, &[]);
-                self.builder.switch_to_block(header_block); // not sealed (not yet all inbound paths defined)
-
+                self.builder.switch_to_block(header_block); 
                 let cond_value = self.translate_expr(cond);
                 self.builder
                     .ins()
                     .brif(cond_value, body_block, &[], exit_block, &[]);
-
-                // now fill the body
+                
                 self.builder.switch_to_block(body_block);
                 self.builder.seal_block(body_block);
                 for stmt in block {
                     self.translate_statement(stmt);
                 }
-                // and jump back to the header
                 self.builder.ins().jump(header_block, &[]);
-
-                // jump to the exit block
                 self.builder.switch_to_block(exit_block);
-                self.builder.seal_block(header_block); // now, the header-block can be sealed
+                self.builder.seal_block(header_block); 
                 self.builder.seal_block(exit_block);
             }
             Statement::Repeat {
@@ -221,21 +170,17 @@ impl Translator<'_> {
             } => {
                 let body_block = self.builder.create_block();
                 let exit_block = self.builder.create_block();
-
                 self.builder.ins().jump(body_block, &[]);
-                self.builder.switch_to_block(body_block); // not sealed yet
-
+                self.builder.switch_to_block(body_block); 
                 for stmt in block {
                     self.translate_statement(stmt);
                 }
-
                 let cond_value = self.translate_expr(cond);
                 self.builder
                     .ins()
                     .brif(cond_value, body_block, &[], exit_block, &[]);
-
                 self.builder.switch_to_block(exit_block);
-                self.builder.seal_block(body_block); // not, the body block can be sealed
+                self.builder.seal_block(body_block); 
                 self.builder.seal_block(exit_block);
             }
             Statement::Local {
@@ -256,24 +201,50 @@ impl Translator<'_> {
                 for (var, val) in vars.iter().zip(values.into_iter()) {
                     match var {
                         Expression::Var(name) => {
-                            // TODO: also resolve global vars, + error handling
                             let var = self.locals.get(name).expect("not defined");
-                            self.builder.def_var(*var, val)
+                            self.builder.def_var(*var, val);
                         }
-                        _ => todo!("not implemented: {:?}", var),
+                        Expression::Field(table, field_name) => {
+                            if let Expression::Var(table_name) = &**table {
+                                if table_name == "_G" {
+                                    let data_id = self.module
+                                        .declare_data(
+                                            field_name,
+                                            Linkage::Export,
+                                            true,  
+                                            false, 
+                                        )
+                                        .expect("Failed to declare global variable data");
+                                    let mut data_desc = DataDescription::new();
+                                    data_desc.define_zeroinit(8); 
+                                    let _ = self.module.define_data(data_id, &data_desc);
+                                    let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                                    let ptr = self.builder.ins().symbol_value(self.int, local_id);
+                                    self.builder.ins().store(MemFlags::trusted(), val, ptr, 0);
+                                } else {
+                                    todo!("not implemented assignment for global table: {:?}", table_name);
+                                }
+                            } else {
+                                todo!("not implemented assignment for field with non-simple table: {:?}", table);
+                            }
+                        }
+                        _ => todo!("not implemented assignment for {:?}", var),
                     }
                 }
             }
             Statement::Return(e) => {
-                // TODO: expr optional
-                // TODO: return_call, if e is a function-call
                 let values: Vec<_> = e.iter().map(|e| self.translate_expr(e)).collect();
                 self.builder.ins().return_(&values);
+                let next_block = self.builder.create_block();
+                self.builder.switch_to_block(next_block);
+                self.builder.seal_block(next_block);
+            }
+            Statement::FunctCall(call) => {
+                self.translate_function_call(call);
             }
             _ => todo!("unimplemented {stmt:?}"),
         }
     }
-
     fn translate_expr(&mut self, expr: &Expression) -> Value {
         match expr {
             Expression::Nil => self.builder.ins().null(self.int),
@@ -282,7 +253,7 @@ impl Translator<'_> {
                 Number::Integer(i) => self.builder.ins().iconst(self.int, *i),
                 Number::Float(f) => self.builder.ins().f64const(*f),
             },
-            Expression::Var(name) => {
+            Expression::Var(name) => {   
                 if let Some(var) = self.locals.get(name) {
                     self.builder.use_var(*var)
                 } else {
@@ -294,18 +265,14 @@ impl Translator<'_> {
                 match op {
                     UnaryOp::Minus => self.builder.ins().ineg(val),
                     UnaryOp::BitNot => self.builder.ins().bnot(val),
-                    // TODO: is there a better way?
                     UnaryOp::Not => self.builder.ins().icmp_imm(IntCC::Equal, val, 0),
                     UnaryOp::Len => todo!(),
                 }
             }
             Expression::Infix(op, exprs) => {
-                // TODO: lazy-eval for`and` & `or`
-                // TODO: left and right assoc.
-                // TODO: integer & float handling
                 let values: Vec<_> = exprs.iter().map(|e| self.translate_expr(e)).collect();
                 let mut values = values.into_iter();
-                let mut e = values.next().unwrap(); // TODO: error
+                let mut e = values.next().unwrap(); 
                 while let Some(val) = values.next() {
                     match op {
                         InfixOp::Add => e = self.builder.ins().iadd(e, val),
@@ -345,35 +312,76 @@ impl Translator<'_> {
                     .declare_data(
                         &data_name,
                         Linkage::Local,
-                        true,
-                        false,
+                        true, 
+                        false, 
                     )
                     .map_err(|e| panic!("Failed to declare data: {}", e))
                     .unwrap();
-
                 let mut data_desc = DataDescription::new();
                 data_desc.define(bytes.as_ref().into());
                 
                 self.module
                     .define_data(data_id, &data_desc)
                     .map_err(|e| panic!("Failed to define data: {}", e))
-                    .unwrap();
-
+                    .unwrap(); 
                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                 let ptr = self.builder.ins().symbol_value(self.int, local_id);
                 ptr
             }
+            Expression::FunctCall(call) => {
+                self.translate_function_call(call)
+            }
+            Expression::Field(table, field) => {
+                
+                if let Expression::Var(table_name) = &**table {
+                    if table_name == "_G" {
+                        let field_name = field.as_str();
+                        let mut data_desc = DataDescription::new();
+                        data_desc.define_zeroinit(8); 
+                        let data_id = self.module
+                            .declare_data(
+                                field_name, 
+                                Linkage::Export,
+                                true,  
+                                false, 
+                            )
+                            .expect("Failed to declare global variable");
+                        
+                        self.module
+                            .define_data(data_id, &data_desc)
+                            .expect("Failed to define global variable data");
+                        
+                        let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                        let ptr = self.builder.ins().symbol_value(self.int, local_id);
+                        return self.builder.ins().load(self.int, MemFlags::trusted(), ptr, 0);
+                    }
+                }
+                self.builder.ins().iconst(self.int, 0)
+            }
             _ => todo!("Unsupported expression {expr:?}"),
         }
     }
-
     fn declare_local(&mut self, name: &str) -> Variable {
         assert!(!self.locals.contains_key(name));
-
         let idx = self.locals.len();
         let var = Variable::new(idx);
         self.locals.insert(name.to_string(), var);
         self.builder.declare_var(var, self.int);
         var
+    }
+    fn translate_function_call(&mut self, call: &FunctionCall) -> Value {
+        
+        match &call.prefix {
+            Expression::Field(table, field) => {
+                self.translate_expr(&table); 
+            }
+            _ => {
+                self.translate_expr(&call.prefix);
+            }
+        }
+        for arg in &call.args {
+            self.translate_expr(arg);
+        }
+        self.builder.ins().iconst(self.int, 0)
     }
 }
