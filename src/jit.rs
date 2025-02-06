@@ -258,6 +258,11 @@ impl Translator<'_> {
             Statement::FunctCall(call) => {
                 self.translate_function_call(call);
             }
+            Statement::Do(block) => {
+                for stmt in block {
+                    self.translate_statement(stmt);
+                }
+            }
             _ => todo!("unimplemented {stmt:?}"),
         }
     }
@@ -292,7 +297,7 @@ impl Translator<'_> {
                         let first_val = self.translate_expr(iter.next().unwrap());
                         let merge_block = self.builder.create_block();
                         self.builder.append_block_param(merge_block, self.int);
-
+    
                         let mut current_val = first_val;
                         for expr in iter {
                             let next_block = self.builder.create_block();
@@ -314,7 +319,7 @@ impl Translator<'_> {
                         let first_val = self.translate_expr(iter.next().unwrap());
                         let merge_block = self.builder.create_block();
                         self.builder.append_block_param(merge_block, self.int);
-
+    
                         let mut current_val = first_val;
                         for expr in iter {
                             let next_block = self.builder.create_block();
@@ -333,23 +338,38 @@ impl Translator<'_> {
                     }
                     _ => {
                         let values: Vec<_> = exprs.iter().map(|e| self.translate_expr(e)).collect();
-                        let mut values = values.into_iter();
-                        let mut e = values.next().unwrap();
-                        while let Some(val) = values.next() {
-                            e = match op {
-                                InfixOp::Add => self.builder.ins().iadd(e, val),
-                                InfixOp::Sub => self.builder.ins().isub(e, val),
-                                InfixOp::Mul => self.builder.ins().imul(e, val),
-                                InfixOp::Div => self.builder.ins().sdiv(e, val),
-                                InfixOp::FloorDiv => self.builder.ins().udiv(e, val),
-                                InfixOp::Mod => self.builder.ins().srem(e, val),
-                                InfixOp::Less => self.builder.ins().icmp(IntCC::SignedLessThan, e, val),
-                                InfixOp::LessEq => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, e, val),
-                                InfixOp::Greater => self.builder.ins().icmp(IntCC::SignedGreaterThan, e, val),
-                                InfixOp::GreaterEq => self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, e, val),
-                                InfixOp::Eq => self.builder.ins().icmp(IntCC::Equal, e, val),
-                                InfixOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, e, val),
-                                other => todo!("unsupported operand {other:?}"),
+                        let mut iter = values.into_iter();
+                        let mut e = iter.next().unwrap();
+                        if *op == InfixOp::Concat {
+                            let mut sig = self.module.make_signature();
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.returns.push(AbiParam::new(self.int));
+                            let func_id = self.module
+                                .declare_function("concat", Linkage::Import, &sig)
+                                .expect("Failed to declare concatenation function");
+                            let concat_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                            for val in iter {
+                                let call = self.builder.ins().call(concat_callee, &[e, val]);
+                                e = self.builder.inst_results(call)[0];
+                            }
+                        } else {
+                            for val in iter {
+                                e = match op {
+                                    InfixOp::Add => self.builder.ins().iadd(e, val),
+                                    InfixOp::Sub => self.builder.ins().isub(e, val),
+                                    InfixOp::Mul => self.builder.ins().imul(e, val),
+                                    InfixOp::Div => self.builder.ins().sdiv(e, val),
+                                    InfixOp::FloorDiv => self.builder.ins().udiv(e, val),
+                                    InfixOp::Mod => self.builder.ins().srem(e, val),
+                                    InfixOp::Less => self.builder.ins().icmp(IntCC::SignedLessThan, e, val),
+                                    InfixOp::LessEq => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, e, val),
+                                    InfixOp::Greater => self.builder.ins().icmp(IntCC::SignedGreaterThan, e, val),
+                                    InfixOp::GreaterEq => self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, e, val),
+                                    InfixOp::Eq => self.builder.ins().icmp(IntCC::Equal, e, val),
+                                    InfixOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, e, val),
+                                    _ => unreachable!("Unexpected operator"),
+                                }
                             }
                         }
                         e
@@ -384,7 +404,6 @@ impl Translator<'_> {
                 self.translate_function_call(call)
             }
             Expression::Field(table, field) => {
-                
                 if let Expression::Var(table_name) = &**table {
                     if table_name == "_G" {
                         let field_name = field.as_str();
