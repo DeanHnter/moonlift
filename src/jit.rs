@@ -144,6 +144,11 @@ impl Translator<'_> {
         }
     }
     fn translate_statement(&mut self, stmt: &Statement) {
+        // Check if we're already in unreachable code
+        if self.builder.is_unreachable() {
+            return;
+        }
+        
         match stmt {
             Statement::If {
                 ref ifcases,
@@ -307,11 +312,11 @@ impl Translator<'_> {
                 }
             }
             Statement::Return(e) => {
+                if self.builder.is_unreachable() {
+                    return;
+                }
                 let values: Vec<_> = e.iter().map(|e| self.translate_expr(e)).collect();
                 self.builder.ins().return_(&values);
-                let next_block = self.builder.create_block();
-                self.builder.switch_to_block(next_block);
-                self.builder.seal_block(next_block);
             }
             Statement::FunctCall(call) => {
                 self.translate_function_call(call);
@@ -319,6 +324,9 @@ impl Translator<'_> {
             Statement::Do(block) => {
                 self.enter_scope();
                 for stmt in block {
+                    if self.builder.is_unreachable() {
+                        break;
+                    }
                     self.translate_statement(stmt);
                 }
                 self.exit_scope();
@@ -780,18 +788,73 @@ impl Translator<'_> {
         var
     }
     fn translate_function_call(&mut self, call: &FunctionCall) -> Value {
+        // Create blocks
+        let call_block = self.builder.create_block();
+        let result_block = self.builder.create_block();
         
-        match &call.prefix {
+        // Add parameter to result block for the function result
+        self.builder.append_block_param(result_block, self.int);
+        
+        // Jump from current block to call block
+        self.builder.ins().jump(call_block, &[]);
+        
+        // Switch to call block and seal it
+        self.builder.switch_to_block(call_block);
+        self.builder.seal_block(call_block);
+        
+        // First evaluate the function prefix to get the function pointer
+        let func_val = match &call.prefix {
             Expression::Field(table, field) => {
-                self.translate_expr(&table); 
+                let table_val = self.translate_expr(table);
+                
+                // Create string constant for field name
+                let data_name = format!("str_{}", self.string_counter);
+                self.string_counter += 1;
+                let data_id = self.declare_global(&data_name, Some(field.as_bytes()));
+                let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                let field_ptr = self.builder.ins().symbol_value(self.int, local_id);
+
+                // Get the function value using lua_gettable
+                let mut sig = self.module.make_signature();
+                sig.params.push(AbiParam::new(self.int));
+                sig.params.push(AbiParam::new(self.int));
+                sig.returns.push(AbiParam::new(self.int));
+                
+                let func_id = self.module
+                    .declare_function("lua_gettable", Linkage::Import, &sig)
+                    .expect("Failed to declare gettable helper function");
+                let gettable_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                let call_inst = self.builder.ins().call(gettable_callee, &[table_val, field_ptr]);
+                self.builder.inst_results(call_inst)[0]
             }
-            _ => {
-                self.translate_expr(&call.prefix);
-            }
+            _ => self.translate_expr(&call.prefix),
+        };
+
+        // Evaluate all arguments
+        let args: Vec<_> = call.args.iter()
+            .map(|arg| self.translate_expr(arg))
+            .collect();
+
+        // Create signature for function call
+        let mut sig = self.module.make_signature();
+        for _ in 0..args.len() {
+            sig.params.push(AbiParam::new(self.int));
         }
-        for arg in &call.args {
-            self.translate_expr(arg);
-        }
-        self.builder.ins().iconst(self.int, 0)
+        sig.returns.push(AbiParam::new(self.int));
+
+        // Create an indirect call
+        let sig_ref = self.builder.import_signature(sig);
+        let call_inst = self.builder.ins().call_indirect(sig_ref, func_val, &args);
+        let result = self.builder.inst_results(call_inst)[0];
+        
+        // Jump to result block with the function result
+        self.builder.ins().jump(result_block, &[result]);
+        
+        // Switch to result block and seal it
+        self.builder.switch_to_block(result_block);
+        self.builder.seal_block(result_block);
+        
+        // Return the result from the phi
+        self.builder.block_params(result_block)[0]
     }
 }
