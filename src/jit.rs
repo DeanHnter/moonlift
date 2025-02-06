@@ -655,9 +655,6 @@ impl Translator<'_> {
                 self.builder.inst_results(call_inst)[0]
             }
             Expression::Table(fields) => {
-                if !fields.is_empty() {
-                    todo!("Table with fields not yet implemented: {:?}", fields);
-                }
                 let mut sig = self.module.make_signature();
                 sig.returns.push(AbiParam::new(self.int));
                 let table_helper_id = self.module
@@ -666,6 +663,37 @@ impl Translator<'_> {
                 let newtable_callee = self.module.declare_func_in_func(table_helper_id, self.builder.func);
                 let call = self.builder.ins().call(newtable_callee, &[]);
                 let table_ptr = self.builder.inst_results(call)[0];
+
+                if !fields.is_empty() {
+                    for field in fields {
+                        match field {
+                            crate::ast::Field::Named(name, expr) => {
+                                let value = self.translate_expr(expr);
+                                let data_name = format!("str_{}", self.string_counter);
+                                self.string_counter += 1;
+                                let data_id = self.declare_global(&data_name, Some(name.as_bytes()));
+                                let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                                let key_ptr = self.builder.ins().symbol_value(self.int, local_id);
+
+                                let mut set_sig = self.module.make_signature();
+                                set_sig.params.push(AbiParam::new(self.int));
+                                set_sig.params.push(AbiParam::new(self.int));
+                                set_sig.params.push(AbiParam::new(self.int));
+                                set_sig.returns.push(AbiParam::new(self.int));
+                                
+                                let settable_id = self.module
+                                    .declare_function("lua_settable", Linkage::Import, &set_sig)
+                                    .expect("Failed to declare settable helper function");
+                                let settable_callee = self.module.declare_func_in_func(settable_id, self.builder.func);
+                                self.builder.ins().call(settable_callee, &[table_ptr, key_ptr, value]);
+                            },
+                            _ => {
+                                todo!("Only Named table fields are implemented. Field: {:?}", field)
+                            }
+                        }
+                    }
+                }
+
                 table_ptr
             }
             Expression::FunctDef(params, body) => {
