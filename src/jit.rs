@@ -84,6 +84,7 @@ impl JIT {
             builder,
             locals: HashMap::new(),
             module: &mut self.module,
+            string_counter: 0,
         };
 
         // declar variables for params
@@ -138,6 +139,7 @@ struct Translator<'a> {
     builder: FunctionBuilder<'a>,
     locals: HashMap<String, Variable>,
     module: &'a mut JITModule,
+    string_counter: usize,
 }
 
 impl Translator<'_> {
@@ -281,9 +283,11 @@ impl Translator<'_> {
                 Number::Float(f) => self.builder.ins().f64const(*f),
             },
             Expression::Var(name) => {
-                // TODO: resolve+error handling
-                let var = self.locals.get(name).expect("variable not defined");
-                self.builder.use_var(*var)
+                if let Some(var) = self.locals.get(name) {
+                    self.builder.use_var(*var)
+                } else {
+                    self.builder.ins().iconst(self.int, 0)
+                }
             }
             Expression::Unary(op, expr) => {
                 let val = self.translate_expr(expr);
@@ -332,6 +336,32 @@ impl Translator<'_> {
                     }
                 }
                 e
+            }
+            Expression::String(bytes) => {
+                let data_name = format!("str_{}", self.string_counter);
+                self.string_counter += 1;
+                
+                let data_id = self.module
+                    .declare_data(
+                        &data_name,
+                        Linkage::Local,
+                        true,
+                        false,
+                    )
+                    .map_err(|e| panic!("Failed to declare data: {}", e))
+                    .unwrap();
+
+                let mut data_desc = DataDescription::new();
+                data_desc.define(bytes.as_ref().into());
+                
+                self.module
+                    .define_data(data_id, &data_desc)
+                    .map_err(|e| panic!("Failed to define data: {}", e))
+                    .unwrap();
+
+                let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                let ptr = self.builder.ins().symbol_value(self.int, local_id);
+                ptr
             }
             _ => todo!("Unsupported expression {expr:?}"),
         }
