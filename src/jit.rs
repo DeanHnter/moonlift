@@ -227,12 +227,12 @@ impl Translator<'_> {
                                         .declare_data(
                                             field_name,
                                             Linkage::Export,
-                                            true,  
-                                            false, 
+                                            true,
+                                            false,
                                         )
                                         .expect("Failed to declare global variable data");
                                     let mut data_desc = DataDescription::new();
-                                    data_desc.define_zeroinit(8); 
+                                    data_desc.define_zeroinit(8);
                                     let _ = self.module.define_data(data_id, &data_desc);
                                     let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                                     let ptr = self.builder.ins().symbol_value(self.int, local_id);
@@ -243,6 +243,22 @@ impl Translator<'_> {
                             } else {
                                 todo!("not implemented assignment for field with non-simple table: {:?}", table);
                             }
+                        }
+                        Expression::Index(table_expr, index_expr) => {
+                            let table_val = self.translate_expr(table_expr);
+                            let index_val = self.translate_expr(index_expr);
+                            
+                            let mut sig = self.module.make_signature();
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.returns.push(AbiParam::new(self.int));
+                            
+                            let func_id = self.module
+                                .declare_function("lua_settable", Linkage::Import, &sig)
+                                .expect("Failed to declare settable helper function");
+                            let settable_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                            self.builder.ins().call(settable_callee, &[table_val, index_val, val]);
                         }
                         _ => todo!("not implemented assignment for {:?}", var),
                     }
@@ -416,7 +432,7 @@ impl Translator<'_> {
                             sig.params.push(AbiParam::new(self.int));
                             sig.returns.push(AbiParam::new(self.int));
                             let func_id = self.module
-                                .declare_function("moonshine_concat", Linkage::Import, &sig)
+                                .declare_function("lua_concat", Linkage::Import, &sig)
                                 .expect("Failed to declare concatenation function");
                             let concat_callee = self.module.declare_func_in_func(func_id, self.builder.func);
                             for val in iter {
@@ -506,7 +522,7 @@ impl Translator<'_> {
                 let mut sig = self.module.make_signature();
                 sig.returns.push(AbiParam::new(self.int));
                 let table_helper_id = self.module
-                    .declare_function("moonshine_newtable", Linkage::Import, &sig)
+                    .declare_function("lua_newtable", Linkage::Import, &sig)
                     .expect("Failed to declare newtable helper function");
                 let newtable_callee = self.module.declare_func_in_func(table_helper_id, self.builder.func);
                 let call = self.builder.ins().call(newtable_callee, &[]);
