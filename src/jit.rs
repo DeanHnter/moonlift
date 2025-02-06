@@ -4,6 +4,7 @@ use crate::Source;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
+use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat};
 
 pub struct JIT {
     builder_context: FunctionBuilderContext,
@@ -24,7 +25,11 @@ impl JIT {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        builder.symbol("lua_len", lua_len as *const u8);
+        builder.symbol("lua_newtable", lua_newtable as *const u8);
+        builder.symbol("lua_settable", lua_settable as *const u8);
+        builder.symbol("lua_concat", lua_concat as *const u8);
         let module = JITModule::new(builder);
         let builder_context = FunctionBuilderContext::new();
         let ctx = module.make_context();
@@ -237,12 +242,38 @@ impl Translator<'_> {
                                     let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                                     let ptr = self.builder.ins().symbol_value(self.int, local_id);
                                     self.builder.ins().store(MemFlags::trusted(), val, ptr, 0);
-                                } else {
-                                    todo!("not implemented assignment for global table: {:?}", table_name);
+                                    continue;
                                 }
-                            } else {
-                                todo!("not implemented assignment for field with non-simple table: {:?}", table);
                             }
+                            let table_val = self.translate_expr(table);
+                            
+                            let data_name = format!("str_{}", self.string_counter);
+                            self.string_counter += 1;
+                            let data_id = self.module
+                                .declare_data(
+                                    &data_name,
+                                    Linkage::Local,
+                                    true, 
+                                    false, 
+                                )
+                                .expect("Failed to declare string constant");
+                            let mut data_desc = DataDescription::new();
+                            data_desc.define(field_name.as_bytes().into());
+                            let _ = self.module.define_data(data_id, &data_desc);
+                            let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                            let index_val = self.builder.ins().symbol_value(self.int, local_id);
+
+                            let mut sig = self.module.make_signature();
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.params.push(AbiParam::new(self.int));
+                            sig.returns.push(AbiParam::new(self.int));
+                            
+                            let func_id = self.module
+                                .declare_function("lua_settable", Linkage::Import, &sig)
+                                .expect("Failed to declare settable helper function");
+                            let settable_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                            self.builder.ins().call(settable_callee, &[table_val, index_val, val]);
                         }
                         Expression::Index(table_expr, index_expr) => {
                             let table_val = self.translate_expr(table_expr);
@@ -373,7 +404,17 @@ impl Translator<'_> {
                     UnaryOp::Minus => self.builder.ins().ineg(val),
                     UnaryOp::BitNot => self.builder.ins().bnot(val),
                     UnaryOp::Not => self.builder.ins().icmp_imm(IntCC::Equal, val, 0),
-                    UnaryOp::Len => todo!(),
+                    UnaryOp::Len => {
+                        let mut sig = self.module.make_signature();
+                        sig.params.push(AbiParam::new(self.int));
+                        sig.returns.push(AbiParam::new(self.int));
+                        let func_id = self.module
+                            .declare_function("lua_len", Linkage::Import, &sig)
+                            .expect("Failed to declare lua_len helper function");
+                        let callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                        let call = self.builder.ins().call(callee, &[val]);
+                        self.builder.inst_results(call)[0]
+                    },
                 }
             }
             Expression::Infix(op, exprs) => {
