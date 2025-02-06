@@ -4,7 +4,7 @@ use crate::Source;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module, DataId};
-use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat, lua_next};
+use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat, lua_next, lua_gettable};
 
 pub struct JIT {
     builder_context: FunctionBuilderContext,
@@ -32,6 +32,7 @@ impl JIT {
         builder.symbol("lua_settable", lua_settable as *const u8);
         builder.symbol("lua_concat", lua_concat as *const u8);
         builder.symbol("lua_next", lua_next as *const u8);
+        builder.symbol("lua_gettable", lua_gettable as *const u8);
         let module = JITModule::new(builder);
         let builder_context = FunctionBuilderContext::new();
         let ctx = module.make_context();
@@ -638,6 +639,20 @@ impl Translator<'_> {
                     }
                 }
                 self.builder.ins().iconst(self.int, 0)
+            }
+            Expression::Index(table, index) => {
+                let table_val = self.translate_expr(table);
+                let index_val = self.translate_expr(index);
+                let mut sig = self.module.make_signature();
+                sig.params.push(AbiParam::new(self.int));
+                sig.params.push(AbiParam::new(self.int));
+                sig.returns.push(AbiParam::new(self.int));
+                let func_id = self.module
+                    .declare_function("lua_gettable", Linkage::Import, &sig)
+                    .expect("Failed to declare gettable helper function");
+                let gettable_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                let call_inst = self.builder.ins().call(gettable_callee, &[table_val, index_val]);
+                self.builder.inst_results(call_inst)[0]
             }
             Expression::Table(fields) => {
                 if !fields.is_empty() {
