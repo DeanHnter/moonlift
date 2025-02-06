@@ -201,8 +201,24 @@ impl Translator<'_> {
                 for (var, val) in vars.iter().zip(values.into_iter()) {
                     match var {
                         Expression::Var(name) => {
-                            let var = self.locals.get(name).expect("not defined");
-                            self.builder.def_var(*var, val);
+                            if let Some(var) = self.locals.get(name) {
+                                self.builder.def_var(*var, val);
+                            } else {
+                                let data_id = self.module
+                                    .declare_data(
+                                        name,
+                                        Linkage::Export,
+                                        true,
+                                        false,
+                                    )
+                                    .expect("Failed to declare global variable data");
+                                let mut data_desc = DataDescription::new();
+                                data_desc.define_zeroinit(8);
+                                let _ = self.module.define_data(data_id, &data_desc);
+                                let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
+                                let ptr = self.builder.ins().symbol_value(self.int, local_id);
+                                self.builder.ins().store(MemFlags::trusted(), val, ptr, 0);
+                            }
                         }
                         Expression::Field(table, field_name) => {
                             if let Expression::Var(table_name) = &**table {
@@ -270,39 +286,75 @@ impl Translator<'_> {
                 }
             }
             Expression::Infix(op, exprs) => {
-                let values: Vec<_> = exprs.iter().map(|e| self.translate_expr(e)).collect();
-                let mut values = values.into_iter();
-                let mut e = values.next().unwrap(); 
-                while let Some(val) = values.next() {
-                    match op {
-                        InfixOp::Add => e = self.builder.ins().iadd(e, val),
-                        InfixOp::Sub => e = self.builder.ins().isub(e, val),
-                        InfixOp::Mul => e = self.builder.ins().imul(e, val),
-                        InfixOp::Div => e = self.builder.ins().sdiv(e, val),
-                        InfixOp::FloorDiv => e = self.builder.ins().udiv(e, val),
-                        InfixOp::Mod => e = self.builder.ins().srem(e, val),
-                        InfixOp::Less => e = self.builder.ins().icmp(IntCC::SignedLessThan, e, val),
-                        InfixOp::LessEq => {
-                            e = self
-                                .builder
-                                .ins()
-                                .icmp(IntCC::SignedLessThanOrEqual, e, val)
+                match op {
+                    InfixOp::Or => {
+                        let mut iter = exprs.iter();
+                        let first_val = self.translate_expr(iter.next().unwrap());
+                        let merge_block = self.builder.create_block();
+                        self.builder.append_block_param(merge_block, self.int);
+
+                        let mut current_val = first_val;
+                        for expr in iter {
+                            let next_block = self.builder.create_block();
+                            let truthy =
+                                self.builder.ins().icmp_imm(IntCC::NotEqual, current_val, 0);
+                            self.builder.ins().brif(truthy, merge_block, &[current_val], next_block, &[]);
+                            self.builder.switch_to_block(next_block);
+                            self.builder.seal_block(next_block);
+                            current_val = self.translate_expr(expr);
                         }
-                        InfixOp::Greater => {
-                            e = self.builder.ins().icmp(IntCC::SignedGreaterThan, e, val)
+                        self.builder.ins().jump(merge_block, &[current_val]);
+                        self.builder.switch_to_block(merge_block);
+                        self.builder.seal_block(merge_block);
+                        let phi = self.builder.block_params(merge_block)[0];
+                        phi
+                    }
+                    InfixOp::And => {
+                        let mut iter = exprs.iter();
+                        let first_val = self.translate_expr(iter.next().unwrap());
+                        let merge_block = self.builder.create_block();
+                        self.builder.append_block_param(merge_block, self.int);
+
+                        let mut current_val = first_val;
+                        for expr in iter {
+                            let next_block = self.builder.create_block();
+                            let falsy =
+                                self.builder.ins().icmp_imm(IntCC::Equal, current_val, 0);
+                            self.builder.ins().brif(falsy, merge_block, &[current_val], next_block, &[]);
+                            self.builder.switch_to_block(next_block);
+                            self.builder.seal_block(next_block);
+                            current_val = self.translate_expr(expr);
                         }
-                        InfixOp::GreaterEq => {
-                            e = self
-                                .builder
-                                .ins()
-                                .icmp(IntCC::SignedGreaterThanOrEqual, e, val)
+                        self.builder.ins().jump(merge_block, &[current_val]);
+                        self.builder.switch_to_block(merge_block);
+                        self.builder.seal_block(merge_block);
+                        let phi = self.builder.block_params(merge_block)[0];
+                        phi
+                    }
+                    _ => {
+                        let values: Vec<_> = exprs.iter().map(|e| self.translate_expr(e)).collect();
+                        let mut values = values.into_iter();
+                        let mut e = values.next().unwrap();
+                        while let Some(val) = values.next() {
+                            e = match op {
+                                InfixOp::Add => self.builder.ins().iadd(e, val),
+                                InfixOp::Sub => self.builder.ins().isub(e, val),
+                                InfixOp::Mul => self.builder.ins().imul(e, val),
+                                InfixOp::Div => self.builder.ins().sdiv(e, val),
+                                InfixOp::FloorDiv => self.builder.ins().udiv(e, val),
+                                InfixOp::Mod => self.builder.ins().srem(e, val),
+                                InfixOp::Less => self.builder.ins().icmp(IntCC::SignedLessThan, e, val),
+                                InfixOp::LessEq => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, e, val),
+                                InfixOp::Greater => self.builder.ins().icmp(IntCC::SignedGreaterThan, e, val),
+                                InfixOp::GreaterEq => self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, e, val),
+                                InfixOp::Eq => self.builder.ins().icmp(IntCC::Equal, e, val),
+                                InfixOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, e, val),
+                                other => todo!("unsupported operand {other:?}"),
+                            }
                         }
-                        InfixOp::Eq => e = self.builder.ins().icmp(IntCC::Equal, e, val),
-                        InfixOp::NotEq => e = self.builder.ins().icmp(IntCC::NotEqual, e, val),
-                        _ => todo!("unsupported operand {op:?}"),
+                        e
                     }
                 }
-                e
             }
             Expression::String(bytes) => {
                 let data_name = format!("str_{}", self.string_counter);
