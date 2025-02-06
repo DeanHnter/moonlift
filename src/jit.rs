@@ -116,7 +116,7 @@ struct Translator<'a> {
     globals: &'a mut HashMap<String, DataId>,
 }
 impl Translator<'_> {
-    fn declare_global(&mut self, name: &str) -> DataId {
+    fn declare_global(&mut self, name: &str, initializer: Option<&[u8]>) -> DataId {
         if let Some(&data_id) = self.globals.get(name) {
             data_id
         } else {
@@ -125,7 +125,11 @@ impl Translator<'_> {
                 .declare_data(name, Linkage::Export, true, false)
                 .expect("Failed to declare global variable data");
             let mut data_desc = DataDescription::new();
-            data_desc.define_zeroinit(8);
+            if let Some(init) = initializer {
+                data_desc.define(init.into());
+            } else {
+                data_desc.define_zeroinit(8);
+            }
             self.module
                 .define_data(data_id, &data_desc)
                 .expect("Failed to define global variable data");
@@ -230,7 +234,7 @@ impl Translator<'_> {
                             if let Some(var) = self.locals.get(name) {
                                 self.builder.def_var(*var, val);
                             } else {
-                                let data_id = self.declare_global(name);
+                                let data_id = self.declare_global(name, None);
                                 
                                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                                 let ptr = self.builder.ins().symbol_value(self.int, local_id);
@@ -240,7 +244,7 @@ impl Translator<'_> {
                         Expression::Field(table, field_name) => {
                             if let Expression::Var(table_name) = &**table {
                                 if table_name == "_G" {
-                                    let data_id = self.declare_global(field_name);
+                                    let data_id = self.declare_global(field_name, None);
                                     
                                     let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                                     let ptr = self.builder.ins().symbol_value(self.int, local_id);
@@ -252,10 +256,7 @@ impl Translator<'_> {
                             
                             let data_name = format!("str_{}", self.string_counter);
                             self.string_counter += 1;
-                            let data_id = self.declare_global(&data_name);
-                            let mut data_desc = DataDescription::new();
-                            data_desc.define(field_name.as_bytes().into());
-                            let _ = self.module.define_data(data_id, &data_desc);
+                            let data_id = self.declare_global(&data_name, Some(field_name.as_bytes()));
                             let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                             let index_val = self.builder.ins().symbol_value(self.int, local_id);
 
@@ -308,43 +309,49 @@ impl Translator<'_> {
             }
             Statement::Function { ref name, ref params, ref body } => {
                 let func_name = name.qname.join(".");
-
+    
                 let mut new_ctx = self.module.make_context();
                 for _ in &params.names {
                     new_ctx.func.signature.params.push(AbiParam::new(self.int));
                 }
                 new_ctx.func.signature.returns.push(AbiParam::new(self.int));
-
+    
                 let mut new_builder_context = FunctionBuilderContext::new();
-                let mut builder = FunctionBuilder::new(&mut new_ctx.func, &mut new_builder_context);
-
-                let entry_block = builder.create_block();
-                builder.append_block_params_for_function_params(entry_block);
-                builder.switch_to_block(entry_block);
-                builder.seal_block(entry_block);
-
-                let mut func_translator = Translator {
-                    int: self.int,
-                    builder,
-                    locals: HashMap::new(),
-                    module: self.module,
-                    string_counter: self.string_counter,
-                    globals: self.globals,
+                let new_string_counter = {
+                    let mut builder =
+                        FunctionBuilder::new(&mut new_ctx.func, &mut new_builder_context);
+    
+                    let entry_block = builder.create_block();
+                    builder.append_block_params_for_function_params(entry_block);
+                    builder.switch_to_block(entry_block);
+                    builder.seal_block(entry_block);
+    
+                    let mut func_translator = Translator {
+                        int: self.int,
+                        builder,
+                        locals: HashMap::new(),
+                        module: self.module,
+                        string_counter: self.string_counter,
+                        globals: self.globals,
+                    };
+    
+                    for (i, param_name) in params.names.iter().enumerate() {
+                        let val = func_translator.builder.block_params(entry_block)[i];
+                        let var = func_translator.declare_local(param_name);
+                        func_translator.builder.def_var(var, val);
+                    }
+    
+                    for stmt in body {
+                        func_translator.translate_statement(stmt);
+                    }
+                    let default_ret = func_translator.builder.ins().iconst(self.int, 0);
+                    func_translator.builder.ins().return_(&[default_ret]);
+                    func_translator.builder.finalize();
+    
+                    func_translator.string_counter
                 };
-
-                for (i, param_name) in params.names.iter().enumerate() {
-                    let val = func_translator.builder.block_params(entry_block)[i];
-                    let var = func_translator.declare_local(param_name);
-                    func_translator.builder.def_var(var, val);
-                }
-
-                for stmt in body {
-                    func_translator.translate_statement(stmt);
-                }
-                let default_ret = func_translator.builder.ins().iconst(self.int, 0);
-                func_translator.builder.ins().return_(&[default_ret]);
-                func_translator.builder.finalize();
-
+                self.string_counter = new_string_counter;
+    
                 let func_id = self
                     .module
                     .declare_function(&func_name, Linkage::Local, &new_ctx.func.signature)
@@ -355,9 +362,10 @@ impl Translator<'_> {
                 self.module.clear_context(&mut new_ctx);
                 self.module.finalize_definitions().unwrap();
                 let func_ptr = self.module.get_finalized_function(func_id);
-
-                let data_id = self.declare_global(&func_name);
-                
+    
+                let global_fn_name = format!("__fn_ptr_{}", func_name);
+                let data_id = self.declare_global(&global_fn_name, None);
+    
                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                 let ptr = {
                     let ins = self.builder.ins();
@@ -499,14 +507,7 @@ impl Translator<'_> {
                 let data_name = format!("str_{}", self.string_counter);
                 self.string_counter += 1;
                 
-                let data_id = self.declare_global(&data_name);
-                let mut data_desc = DataDescription::new();
-                data_desc.define(bytes.as_ref().into());
-                
-                self.module
-                    .define_data(data_id, &data_desc)
-                    .map_err(|e| panic!("Failed to define data: {}", e))
-                    .unwrap(); 
+                let data_id = self.declare_global(&data_name, Some(bytes.as_ref()));
                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                 let ptr = self.builder.ins().symbol_value(self.int, local_id);
                 ptr
@@ -518,7 +519,7 @@ impl Translator<'_> {
                 if let Expression::Var(table_name) = &**table {
                     if table_name == "_G" {
                         let field_name = field.as_str();
-                        let data_id = self.declare_global(field_name);
+                        let data_id = self.declare_global(field_name, None);
                         let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                         let ptr = self.builder.ins().symbol_value(self.int, local_id);
                         return self.builder.ins().load(self.int, MemFlags::trusted(), ptr, 0);
