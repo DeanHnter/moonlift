@@ -3,7 +3,7 @@ use crate::ast::{Expression, FunctionCall, InfixOp, Number, Statement, UnaryOp};
 use crate::Source;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataDescription, Linkage, Module};
+use cranelift_module::{DataDescription, Linkage, Module, DataId};
 use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat};
 
 pub struct JIT {
@@ -11,6 +11,7 @@ pub struct JIT {
     ctx: codegen::Context,
     data_description: DataDescription,
     module: JITModule,
+    global_data: HashMap<String, DataId>,
 }
 
 impl JIT {
@@ -39,6 +40,7 @@ impl JIT {
             ctx,
             data_description,
             module,
+            global_data: HashMap::new(),
         }
     }
 
@@ -65,6 +67,7 @@ impl JIT {
             locals: HashMap::new(),
             module: &mut self.module,
             string_counter: 0,
+            globals: &mut self.global_data,
         };
         
         for (i, param) in params.iter().enumerate() {
@@ -110,8 +113,26 @@ struct Translator<'a> {
     locals: HashMap<String, Variable>,
     module: &'a mut JITModule,
     string_counter: usize,
+    globals: &'a mut HashMap<String, DataId>,
 }
 impl Translator<'_> {
+    fn declare_global(&mut self, name: &str) -> DataId {
+        if let Some(&data_id) = self.globals.get(name) {
+            data_id
+        } else {
+            let data_id = self
+                .module
+                .declare_data(name, Linkage::Export, true, false)
+                .expect("Failed to declare global variable data");
+            let mut data_desc = DataDescription::new();
+            data_desc.define_zeroinit(8);
+            self.module
+                .define_data(data_id, &data_desc)
+                .expect("Failed to define global variable data");
+            self.globals.insert(name.to_string(), data_id);
+            data_id
+        }
+    }
     fn translate_statement(&mut self, stmt: &Statement) {
         match stmt {
             Statement::If {
@@ -209,17 +230,8 @@ impl Translator<'_> {
                             if let Some(var) = self.locals.get(name) {
                                 self.builder.def_var(*var, val);
                             } else {
-                                let data_id = self.module
-                                    .declare_data(
-                                        name,
-                                        Linkage::Export,
-                                        true,
-                                        false,
-                                    )
-                                    .expect("Failed to declare global variable data");
-                                let mut data_desc = DataDescription::new();
-                                data_desc.define_zeroinit(8);
-                                let _ = self.module.define_data(data_id, &data_desc);
+                                let data_id = self.declare_global(name);
+                                
                                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                                 let ptr = self.builder.ins().symbol_value(self.int, local_id);
                                 self.builder.ins().store(MemFlags::trusted(), val, ptr, 0);
@@ -228,17 +240,8 @@ impl Translator<'_> {
                         Expression::Field(table, field_name) => {
                             if let Expression::Var(table_name) = &**table {
                                 if table_name == "_G" {
-                                    let data_id = self.module
-                                        .declare_data(
-                                            field_name,
-                                            Linkage::Export,
-                                            true,
-                                            false,
-                                        )
-                                        .expect("Failed to declare global variable data");
-                                    let mut data_desc = DataDescription::new();
-                                    data_desc.define_zeroinit(8);
-                                    let _ = self.module.define_data(data_id, &data_desc);
+                                    let data_id = self.declare_global(field_name);
+                                    
                                     let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                                     let ptr = self.builder.ins().symbol_value(self.int, local_id);
                                     self.builder.ins().store(MemFlags::trusted(), val, ptr, 0);
@@ -249,14 +252,7 @@ impl Translator<'_> {
                             
                             let data_name = format!("str_{}", self.string_counter);
                             self.string_counter += 1;
-                            let data_id = self.module
-                                .declare_data(
-                                    &data_name,
-                                    Linkage::Local,
-                                    true, 
-                                    false, 
-                                )
-                                .expect("Failed to declare string constant");
+                            let data_id = self.declare_global(&data_name);
                             let mut data_desc = DataDescription::new();
                             data_desc.define(field_name.as_bytes().into());
                             let _ = self.module.define_data(data_id, &data_desc);
@@ -333,6 +329,7 @@ impl Translator<'_> {
                     locals: HashMap::new(),
                     module: self.module,
                     string_counter: self.string_counter,
+                    globals: self.globals,
                 };
 
                 for (i, param_name) in params.names.iter().enumerate() {
@@ -359,13 +356,8 @@ impl Translator<'_> {
                 self.module.finalize_definitions().unwrap();
                 let func_ptr = self.module.get_finalized_function(func_id);
 
-                let data_id = self
-                    .module
-                    .declare_data(&func_name, Linkage::Export, true, false)
-                    .expect("Failed to declare global function data");
-                let mut data_desc = DataDescription::new();
-                data_desc.define_zeroinit(8);
-                let _ = self.module.define_data(data_id, &data_desc);
+                let data_id = self.declare_global(&func_name);
+                
                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                 let ptr = {
                     let ins = self.builder.ins();
@@ -507,15 +499,7 @@ impl Translator<'_> {
                 let data_name = format!("str_{}", self.string_counter);
                 self.string_counter += 1;
                 
-                let data_id = self.module
-                    .declare_data(
-                        &data_name,
-                        Linkage::Local,
-                        true, 
-                        false, 
-                    )
-                    .map_err(|e| panic!("Failed to declare data: {}", e))
-                    .unwrap();
+                let data_id = self.declare_global(&data_name);
                 let mut data_desc = DataDescription::new();
                 data_desc.define(bytes.as_ref().into());
                 
@@ -534,21 +518,7 @@ impl Translator<'_> {
                 if let Expression::Var(table_name) = &**table {
                     if table_name == "_G" {
                         let field_name = field.as_str();
-                        let mut data_desc = DataDescription::new();
-                        data_desc.define_zeroinit(8); 
-                        let data_id = self.module
-                            .declare_data(
-                                field_name, 
-                                Linkage::Export,
-                                true,  
-                                false, 
-                            )
-                            .expect("Failed to declare global variable");
-                        
-                        self.module
-                            .define_data(data_id, &data_desc)
-                            .expect("Failed to define global variable data");
-                        
+                        let data_id = self.declare_global(field_name);
                         let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                         let ptr = self.builder.ins().symbol_value(self.int, local_id);
                         return self.builder.ins().load(self.int, MemFlags::trusted(), ptr, 0);
