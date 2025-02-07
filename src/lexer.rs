@@ -556,6 +556,12 @@ impl<S: Source> Lexer<S> {
                 }
                 return Ok(Token::Whitespace);
             }
+            b'u' => {
+                return Ok(Token::Symbol("u"));
+            }
+            b'z' => {
+                return Ok(Token::Symbol("z"));
+            }
             _ => return Err(LexerError::UnexpectedCharacter(c as char, "token")),
         }
     }
@@ -701,28 +707,29 @@ impl<S: Source> Lexer<S> {
             if c == until {
                 return Ok(());
             } else if c == b'\\' {
-                let Some(c) = self.source.read_next()? else {
-                    break;
-                };
-                self.value.push(match c {
-                    b'a' => 0x07,
-                    b'0' => 0x00,
-                    b'b' => 0x08,
-                    b'f' => 0x0C,
-                    b'n' => b'\n',
-                    b'r' => b'\r',
-                    b't' => b'\t',
-                    b'v' => 0x0B,
-                    b'\'' => b'\'',
-                    b'\"' => b'\"',
-                    b'\\' => b'\\',
+                // Process an escape sequence.
+                let esc = self.source.read_next()?
+                    .ok_or_else(|| LexerError::UnexpectedEOF("escape sequence"))?;
+
+                match esc {
+                    b'a' => self.value.push(0x07),
+                    b'0' => self.value.push(0x00),
+                    b'b' => self.value.push(0x08),
+                    b'f' => self.value.push(0x0C),
+                    b'n' => self.value.push(b'\n'),
+                    b'r' => self.value.push(b'\r'),
+                    b't' => self.value.push(b'\t'),
+                    b'v' => self.value.push(0x0B),
+                    b'\'' => self.value.push(b'\''),
+                    b'\"' => self.value.push(b'\"'),
+                    b'\\' => self.value.push(b'\\'),
                     b'\n' => {
                         if !matches!(self.source.read_next()?, Some(b'\r')) {
                             self.source.unwind();
                         }
                         self.line += 1;
                         self.line_pos = self.source.pos();
-                        b'\n'
+                        self.value.push(b'\n');
                     }
                     b'\r' => {
                         if !matches!(self.source.read_next()?, Some(b'\n')) {
@@ -730,67 +737,95 @@ impl<S: Source> Lexer<S> {
                         }
                         self.line += 1;
                         self.line_pos = self.source.pos();
-                        b'\n'
+                        self.value.push(b'\n');
                     }
                     b'0'..=b'9' => {
-                        // decimal (up to 3 digits)
-                        let mut v = c - b'0';
-                        if let Some(c @ (b'0'..=b'9')) = self.source.read_next()? {
-                            v *= 10;
-                            v += c - b'0';
-                            if let Some(c @ (b'0'..=b'9')) = self.source.read_next()? {
-                                v *= 10;
-                                v += c - b'0';
+                        // decimal escape (up to 3 digits)
+                        let mut v = esc - b'0';
+                        if let Some(c) = self.source.read_next()? {
+                            if c >= b'0' && c <= b'9' {
+                                v = v * 10 + (c - b'0');
+                                if let Some(c) = self.source.read_next()? {
+                                    if c >= b'0' && c <= b'9' {
+                                        v = v * 10 + (c - b'0');
+                                    } else {
+                                        self.source.unwind();
+                                    }
+                                }
                             } else {
                                 self.source.unwind();
                             }
-                        } else {
-                            self.source.unwind();
                         }
-                        v
+                        self.value.push(v);
                     }
                     b'x' => {
-                        // hex
-                        let Some(v) = self.source.read_next()?.and_then(Self::hex_digit_value) else {
-                            return Err(LexerError::InvalidEscapeSequence(c as char));
+                        // hex escape: exactly two hex digits
+                        let v = if let Some(d) = self.source.read_next()?.and_then(Self::hex_digit_value) {
+                            d
+                        } else {
+                            return Err(LexerError::InvalidEscapeSequence(esc as char));
                         };
-                        let Some(v2) = self.source.read_next()?.and_then(Self::hex_digit_value) else {
-                            return Err(LexerError::InvalidEscapeSequence(c as char));
+                        let v2 = if let Some(d) = self.source.read_next()?.and_then(Self::hex_digit_value) {
+                            d
+                        } else {
+                            self.source.unwind();
+                            return Err(LexerError::InvalidEscapeSequence('x'));
                         };
-                        v << 4 | v2
+                        self.value.push(v << 4 | v2);
                     }
                     b'u' => {
-                        // unicode as utf-8 (\u{XXX})
-                        if !matches!(self.source.read_next()?, Some(b'{')) {
-                            return Err(LexerError::InvalidEscapeSequence(c as char));
-                        }
-                        let mut v = if let Some(v)= self.source.read_next()?.and_then(Self::hex_digit_value) {
-                            v as u32
+                        let next = self.source.read_next()?;
+                        let codepoint: u32;
+                        if next == Some(b'{') {
+                            let mut count = 0;
+                            let mut acc = 0u32;
+                            loop {
+                                let digit = self.source.read_next()?;
+                                if digit == Some(b'}') {
+                                    if count == 0 {
+                                        return Err(LexerError::InvalidEscapeSequence('u'));
+                                    }
+                                    break;
+                                }
+                                if let Some(d) = digit.and_then(Self::hex_digit_value) {
+                                    acc = (acc << 4) | d as u32;
+                                    count += 1;
+                                    if count >= 8 {
+                                        let brace = self.source.read_next()?;
+                                        if brace != Some(b'}') {
+                                            return Err(LexerError::InvalidEscapeSequence('u'));
+                                        }
+                                        break;
+                                    }
+                                } else {
+                                    return Err(LexerError::InvalidEscapeSequence('u'));
+                                }
+                            }
+                            codepoint = acc;
                         } else {
-                            return Err(LexerError::InvalidEscapeSequence(c as char));
-                        };
-                        for _ in 1..8 {
-                            let Some(v2) = self.source.read_next()?.and_then(Self::hex_digit_value) else {
-                                self.source.unwind();
-                                break;
-                            };
-                            v <<= 4;
-                            v |= v2 as u32;
+                            self.source.unwind();
+                            let mut acc = 0u32;
+                            for _ in 0..4 {
+                                let b = self.source.read_next()?;
+                                if let Some(d) = b.and_then(Self::hex_digit_value) {
+                                    acc = (acc << 4) | d as u32;
+                                } else {
+                                    return Err(LexerError::InvalidEscapeSequence('u'));
+                                }
+                            }
+                            codepoint = acc;
                         }
-                        if !matches!(self.source.read_next()?, Some(b'}')) {
-                            return Err(LexerError::InvalidEscapeSequence(c as char));
-                        }
-                        let Some(chr) = char::from_u32(v) else {
-                            return Err(LexerError::InvalidEscapeSequence(c as char));
-                        };
-                        let mut buf = [0u8;4];
-                        for c in chr.encode_utf8(&mut buf).as_bytes().iter().copied() {
-                            self.value.push(c);
-                        }
+
+                        // If the computed codepoint is invalid (e.g. 0x110000 > 0x10FFFF),
+                        // substitute with the Unicode replacement character (U+FFFD)
+                        let chr = char::from_u32(codepoint).unwrap_or('\u{FFFD}');
+                        let mut buf = [0u8; 4];
+                        let s = chr.encode_utf8(&mut buf);
+                        self.value.extend_from_slice(s.as_bytes());
                         continue;
                     }
                     b'z' => {
-                        // skip whitespaces
+                        // skip whitespace after \z
                         loop {
                             match self.source.read_next()? {
                                 Some(b'\n') => {
@@ -814,10 +849,9 @@ impl<S: Source> Lexer<S> {
                                 }
                             }
                         }
-                        continue;
                     }
-                    _ => return Err(LexerError::InvalidEscapeSequence(c as char)),
-                });
+                    _ => return Err(LexerError::InvalidEscapeSequence(esc as char)),
+                }
             } else if c == b'\r' || c == b'\n' {
                 return Err(LexerError::UnexpectedLineBreak);
             } else {
