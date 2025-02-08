@@ -5,6 +5,14 @@ use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module, DataId};
 use crate::runtime::{lua_len, lua_newtable, lua_settable, lua_concat, lua_next, lua_gettable};
+use std::collections::HashSet;
+use cranelift::codegen::ir::Opcode;
+use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift::codegen::ir::{Block, Type};
+use cranelift::codegen::verify_function;
+use cranelift::codegen::Context;
+use cranelift_module::ModuleError;
+use std::collections::VecDeque;
 
 pub struct JIT {
     builder_context: FunctionBuilderContext,
@@ -51,27 +59,32 @@ impl JIT {
         Ok(())
     }
 
-    fn compile_fn(&mut self, params: &[String], block: &[Statement]) -> Result<*const u8, String> {
+    pub fn compile_fn(&mut self, params: &[String], block: &[Statement]) -> Result<*const u8, String> {
         let int = self.module.target_config().pointer_type();
         
         for _ in params {
             self.ctx.func.signature.params.push(AbiParam::new(int));
         }
+        self.ctx.func.signature.returns.push(AbiParam::new(int));
         
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
-        let entry_block = builder.create_block();
+        let mut block_mgr = BlockManager::new(int);
+        
+        let entry_block = block_mgr.create_block(&mut builder);
         builder.append_block_params_for_function_params(entry_block);
-        builder.switch_to_block(entry_block);
-        builder.seal_block(entry_block);
+        block_mgr.switch_to_block(&mut builder, entry_block);
+        
         let mut translator = Translator {
             int,
             builder,
+            block_mgr,
             locals: HashMap::new(),
             scopes: Vec::new(),
             next_var: 0,
             module: &mut self.module,
             string_counter: 0,
             globals: &mut self.global_data,
+            terminated: false,
         };
         
         for (i, param) in params.iter().enumerate() {
@@ -81,9 +94,24 @@ impl JIT {
         }
         
         for stmt in block {
+            // If the translator is marked terminated or the builder block is unreachable, stop processing further statements.
+            if translator.terminated || translator.builder.is_unreachable() {
+                break;
+            }
             translator.translate_statement(stmt);
         }
-    
+
+        // Ensure the current block is properly terminated.
+        if !translator.builder.is_unreachable() {
+            let default_ret = translator.builder.ins().iconst(translator.int, 0);
+            translator.builder.ins().return_(&[default_ret]);
+            eprintln!("Debug [compile_fn]: Added default return instruction.");
+        }
+
+        // Finalize all blocks properly
+        translator.block_mgr.finalize_blocks(&mut translator.builder);
+
+        // Finalize the builder to emit the function.
         translator.builder.finalize();
         
         let id = self
@@ -97,11 +125,17 @@ impl JIT {
         
         self.module.clear_context(&mut self.ctx);
         
-        
-        
-        self.module.finalize_definitions().unwrap();
+        self.module.finalize_definitions()
+            .map_err(|e| format!("Failed to finalize definitions: {}", e))?;
         
         let code = self.module.get_finalized_function(id);
+
+        // After building the function:
+        match verify_function(&self.ctx.func, self.module.isa()) {
+            Ok(_) => eprintln!("Function verified successfully."),
+            Err(e) => return Err(format!("Verification failed: {:?}", e)),
+        }
+        
         Ok(code)
     }
 }
@@ -114,12 +148,14 @@ impl Default for JIT {
 struct Translator<'a> {
     int: types::Type,
     builder: FunctionBuilder<'a>,
+    block_mgr: BlockManager,
     locals: HashMap<String, Vec<Variable>>,
     scopes: Vec<Vec<String>>,
     next_var: usize,
     module: &'a mut JITModule,
     string_counter: usize,
     globals: &'a mut HashMap<String, DataId>,
+    terminated: bool,
 }
 impl Translator<'_> {
     fn declare_global(&mut self, name: &str, initializer: Option<&[u8]>) -> DataId {
@@ -143,73 +179,157 @@ impl Translator<'_> {
             data_id
         }
     }
+    fn ensure_valid_block(&mut self, add_params: bool) {
+        // Check if we need a new block
+        let need_new_block = match self.block_mgr.get_current_block() {
+            None => true,
+            Some(block) => {
+                self.builder.is_unreachable() ||
+                self.block_mgr.is_block_inserted(&self.builder, block)
+            }
+        };
+
+        if need_new_block {
+            // Create a new block and switch to it
+            let new_block = self.block_mgr.create_block(&mut self.builder);
+            if add_params {
+                self.builder.append_block_params_for_function_params(new_block);
+            }
+            
+            self.block_mgr.switch_to_block(&mut self.builder, new_block);
+        }
+    }
     fn translate_statement(&mut self, stmt: &Statement) {
-        // Check if we're already in unreachable code
-        if self.builder.is_unreachable() {
+        if self.terminated {
+            eprintln!("Debug: Skipping statement because translator marked terminated: {:?}", stmt);
             return;
         }
+
+        // Ensure we have a valid block before processing the statement
+        self.ensure_valid_block(true);
         
         match stmt {
-            Statement::If {
-                ref ifcases,
-                ref elsecase,
-            } => {
-                let merge_block = self.builder.create_block();
+            Statement::If { ref ifcases, ref elsecase } => {
+                let merge_block = self.block_mgr.create_block(&mut self.builder);
+                let mut branch_non_terminated = false;
+                let mut all_branches_terminated = true;  // Track if all branches terminate
+
+                let mut current_test_block = self.block_mgr.get_current_block().unwrap();
+
+                // Process each if‑case.
                 for (cond, block) in ifcases {
+                    // Evaluate condition in current block
                     let cond_value = self.translate_expr(cond);
-                    let then_block = self.builder.create_block();
-                    let else_block = self.builder.create_block();
-                    self.builder
-                        .ins()
-                        .brif(cond_value, then_block, &[], else_block, &[]);
-                    
-                    self.builder.switch_to_block(then_block);
-                    self.builder.seal_block(then_block);
+                    let then_block = self.block_mgr.create_block(&mut self.builder);
+                    let else_block = self.block_mgr.create_block(&mut self.builder);
+
+                    // Add the conditional branch
+                    self.builder.ins().brif(cond_value, then_block, &[], else_block, &[]);
+                    self.block_mgr.seal(&mut self.builder, current_test_block);
+
+                    // Process the "then" block
+                    self.block_mgr.switch_to_block(&mut self.builder, then_block);
+                    self.terminated = false;
                     self.enter_scope();
+                    
                     for stmt in block {
+                        if self.builder.is_unreachable() || self.terminated {
+                            break;
+                        }
                         self.translate_statement(stmt);
                     }
+                    
+                    let then_terminated = self.terminated;
                     self.exit_scope();
-                    self.builder.ins().jump(merge_block, &[]);
-                    self.builder.switch_to_block(else_block);
-                    self.builder.seal_block(else_block);
+                    
+                    // Update all_branches_terminated
+                    all_branches_terminated &= then_terminated;
+                    
+                    if !then_terminated && !self.builder.is_unreachable() {
+                        self.block_mgr.jump_to_block(&mut self.builder, merge_block);
+                        branch_non_terminated = true;
+                    }
+                    self.block_mgr.seal(&mut self.builder, then_block);
+
+                    // Continue with the else block
+                    self.block_mgr.switch_to_block(&mut self.builder, else_block);
+                    current_test_block = else_block;
+                }
+
+                // Process the final else block
+                self.enter_scope();
+                self.terminated = false;
+                
+                for stmt in elsecase {
+                    if self.builder.is_unreachable() {
+                        break;
+                    }
+                    self.translate_statement(stmt);
+                    if self.terminated {
+                        break;
+                    }
                 }
                 
-                self.enter_scope();
-                for stmt in elsecase {
-                    self.translate_statement(stmt);
-                }
+                let else_terminated = self.terminated;
                 self.exit_scope();
                 
-                self.builder.ins().jump(merge_block, &[]);
-                self.builder.switch_to_block(merge_block);
-                self.builder.seal_block(merge_block);
+                // Update all_branches_terminated with else block
+                all_branches_terminated &= else_terminated;
+
+                if !else_terminated && !self.builder.is_unreachable() {
+                    self.block_mgr.jump_to_block(&mut self.builder, merge_block);
+                    branch_non_terminated = true;
+                }
+                self.block_mgr.seal(&mut self.builder, current_test_block);
+
+                if branch_non_terminated {
+                    self.block_mgr.switch_to_block(&mut self.builder, merge_block);
+                    self.block_mgr.seal(&mut self.builder, merge_block);
+                    self.terminated = false;
+                } else {
+                    self.terminated = all_branches_terminated;
+                }
             }
             Statement::While {
                 ref cond,
                 ref block,
             } => {
+                eprintln!("Debug: Processing While statement");
                 let header_block = self.builder.create_block();
                 let body_block = self.builder.create_block();
                 let exit_block = self.builder.create_block();
-                self.builder.ins().jump(header_block, &[]);
-                self.builder.switch_to_block(header_block); 
+
+                if !self.builder.is_unreachable() {
+                    self.block_mgr.jump_to_block(&mut self.builder, header_block);
+                }
+
+                self.builder.switch_to_block(header_block);
+
                 let cond_value = self.translate_expr(cond);
+
                 self.builder
                     .ins()
                     .brif(cond_value, body_block, &[], exit_block, &[]);
-                
+
+                self.block_mgr.seal(&mut self.builder, header_block);
+
                 self.builder.switch_to_block(body_block);
-                self.builder.seal_block(body_block);
                 self.enter_scope();
                 for stmt in block {
+                    if self.builder.is_unreachable() {
+                        break;
+                    }
                     self.translate_statement(stmt);
                 }
+                if !self.builder.is_unreachable() {
+                    self.builder.ins().jump(header_block, &[]);
+                }
                 self.exit_scope();
-                self.builder.ins().jump(header_block, &[]);
+
                 self.builder.switch_to_block(exit_block);
-                self.builder.seal_block(header_block); 
-                self.builder.seal_block(exit_block);
+
+                self.block_mgr.seal(&mut self.builder, body_block);
+                self.block_mgr.seal(&mut self.builder, exit_block);
             }
             Statement::Repeat {
                 ref block,
@@ -217,20 +337,27 @@ impl Translator<'_> {
             } => {
                 let body_block = self.builder.create_block();
                 let exit_block = self.builder.create_block();
-                self.builder.ins().jump(body_block, &[]);
-                self.builder.switch_to_block(body_block); 
+                if !self.builder.is_unreachable() {
+                    self.builder.ins().jump(body_block, &[]);
+                }
+                self.builder.switch_to_block(body_block);
                 self.enter_scope();
                 for stmt in block {
+                    if self.builder.is_unreachable() {
+                        break;
+                    }
                     self.translate_statement(stmt);
                 }
-                self.exit_scope();
                 let cond_value = self.translate_expr(cond);
-                self.builder
-                    .ins()
-                    .brif(cond_value, body_block, &[], exit_block, &[]);
+                if !self.builder.is_unreachable() {
+                    self.builder
+                        .ins()
+                        .brif(cond_value, exit_block, &[], body_block, &[]);
+                }
+                self.exit_scope();
                 self.builder.switch_to_block(exit_block);
-                self.builder.seal_block(body_block); 
-                self.builder.seal_block(exit_block);
+                self.block_mgr.seal(&mut self.builder, body_block);
+                self.block_mgr.seal(&mut self.builder, exit_block);
             }
             Statement::Local {
                 ref vars,
@@ -311,15 +438,41 @@ impl Translator<'_> {
                     }
                 }
             }
-            Statement::Return(e) => {
-                if self.builder.is_unreachable() {
-                    return;
+            Statement::Return(ref exprs) => {
+                eprintln!("Debug [RETURN]: Starting return statement processing");
+                
+                // Now handle the return
+                let return_val = if exprs.is_empty() {
+                    self.builder.ins().iconst(self.int, 0)
+                } else if exprs.len() == 1 {
+                    self.translate_expr(&exprs[0])
+                } else {
+                    // TODO: Handle multiple return values
+                    self.translate_expr(&exprs[0])
+                };
+                
+                // Add the return instruction if possible
+                if !self.builder.is_unreachable() {
+                    self.builder.ins().return_(&[return_val]);
+                    eprintln!("Debug [RETURN]: Added return instruction.");
                 }
-                let values: Vec<_> = e.iter().map(|e| self.translate_expr(e)).collect();
-                self.builder.ins().return_(&values);
+                
+                // Seal the current block if needed
+                if let Some(current) = self.block_mgr.get_current_block() {
+                    if !self.block_mgr.sealed_blocks.contains(&(current.index() as u32)) {
+                        self.block_mgr.seal(&mut self.builder, current);
+                        eprintln!("Debug [RETURN]: Sealed current block {:?}", current);
+                    }
+                }
+                
+                // Clear the current block so that later ensure_valid_block calls don't try to switch from a terminated block
+                self.block_mgr.current_block = None;
+                
+                eprintln!("Debug [RETURN]: Block marked as terminated");
+                self.terminated = true;
             }
             Statement::FunctCall(call) => {
-                self.translate_function_call(call);
+                let _ = self.translate_function_call(call);
             }
             Statement::Do(block) => {
                 self.enter_scope();
@@ -353,12 +506,14 @@ impl Translator<'_> {
                     let mut func_translator = Translator {
                         int: self.int,
                         builder,
+                        block_mgr: BlockManager::new(self.int),
                         locals: HashMap::new(),
                         scopes: vec![Vec::new()],
                         next_var: 0,
                         module: self.module,
                         string_counter: self.string_counter,
                         globals: self.globals,
+                        terminated: false,
                     };
     
                     for (i, param_name) in params.names.iter().enumerate() {
@@ -423,10 +578,11 @@ impl Translator<'_> {
                                     
                                     self.builder.append_block_param(loop_body, self.int);
                                     
-                                    self.builder.ins().jump(loop_header, &[]);
+                                    if !self.builder.is_unreachable() {
+                                        self.block_mgr.jump_to_block(&mut self.builder, loop_header);
+                                    }
                                     
                                     self.builder.switch_to_block(loop_header);
-                                    self.builder.seal_block(loop_header);
                                     
                                     let current_key = self.builder.use_var(iter_key_var);
                                     
@@ -447,28 +603,47 @@ impl Translator<'_> {
                                     self.builder.ins().brif(cmp, loop_exit, &[], loop_body, &[next_key]);
                                     
                                     self.builder.switch_to_block(loop_body);
-                                    self.builder.seal_block(loop_body);
+                                    
                                     let loop_current_key = self.builder.block_params(loop_body)[0];
                                     
                                     if let Some(loop_var_name) = vars.get(0) {
                                         let loop_var = self.declare_local(loop_var_name);
                                         self.builder.def_var(loop_var, loop_current_key);
                                     }
+                                    if let Some(loop_var_value) = vars.get(1) {
+                                        let mut sig = self.module.make_signature();
+                                        sig.params.push(AbiParam::new(self.int));
+                                        sig.params.push(AbiParam::new(self.int));
+                                        sig.returns.push(AbiParam::new(self.int));
+                                        
+                                        let func_id = self.module
+                                            .declare_function("lua_gettable", Linkage::Import, &sig)
+                                            .expect("Failed to declare lua_gettable helper function");
+                                        let lua_gettable_callee = self.module.declare_func_in_func(func_id, self.builder.func);
+                                        let gettable_call = self.builder.ins().call(lua_gettable_callee, &[table_val, loop_current_key]);
+                                        let value = self.builder.inst_results(gettable_call)[0];
+                                        
+                                        let loop_var = self.declare_local(loop_var_value);
+                                        self.builder.def_var(loop_var, value);
+                                    }
                                     
                                     self.enter_scope();
                                     for stmt in block {
+                                        if self.builder.is_unreachable() {
+                                            break;
+                                        }
                                         self.translate_statement(stmt);
                                     }
                                     self.exit_scope();
                                     
-                                    self.builder.def_var(iter_key_var, loop_current_key);
+                                    self.builder.def_var(iter_key_var, next_key);
                                     
-                                    self.builder.ins().jump(loop_header, &[]);
+                                    if !self.builder.is_unreachable() {
+                                        self.block_mgr.jump_to_block(&mut self.builder, loop_header);
+                                    }
                                     
                                     self.builder.switch_to_block(loop_exit);
-                                    self.builder.seal_block(loop_exit);
-                                    
-                                    return;
+                                    self.block_mgr.seal(&mut self.builder, loop_exit);
                                 }
                             }
                         }
@@ -538,7 +713,9 @@ impl Translator<'_> {
                             self.builder.seal_block(next_block);
                             current_val = self.translate_expr(expr);
                         }
-                        self.builder.ins().jump(merge_block, &[current_val]);
+                        if !self.builder.is_unreachable() {
+                            self.builder.ins().jump(merge_block, &[current_val]);
+                        }
                         self.builder.switch_to_block(merge_block);
                         self.builder.seal_block(merge_block);
                         let phi = self.builder.block_params(merge_block)[0];
@@ -560,7 +737,9 @@ impl Translator<'_> {
                             self.builder.seal_block(next_block);
                             current_val = self.translate_expr(expr);
                         }
-                        self.builder.ins().jump(merge_block, &[current_val]);
+                        if !self.builder.is_unreachable() {
+                            self.builder.ins().jump(merge_block, &[current_val]);
+                        }
                         self.builder.switch_to_block(merge_block);
                         self.builder.seal_block(merge_block);
                         let phi = self.builder.block_params(merge_block)[0];
@@ -723,12 +902,14 @@ impl Translator<'_> {
                     let mut func_translator = Translator {
                         int: self.int,
                         builder,
+                        block_mgr: BlockManager::new(self.int),
                         locals: HashMap::new(),
                         scopes: vec![Vec::new()],
                         next_var: 0,
                         module: self.module,
                         string_counter: self.string_counter,
                         globals: self.globals,
+                        terminated: false,
                     };
                     for (i, param_name) in params.names.iter().enumerate() {
                         let val = func_translator.builder.block_params(entry_block)[i];
@@ -788,38 +969,21 @@ impl Translator<'_> {
         var
     }
     fn translate_function_call(&mut self, call: &FunctionCall) -> Value {
-        // Create blocks
-        let call_block = self.builder.create_block();
-        let result_block = self.builder.create_block();
-        
-        // Add parameter to result block for the function result
-        self.builder.append_block_param(result_block, self.int);
-        
-        // Jump from current block to call block
-        self.builder.ins().jump(call_block, &[]);
-        
-        // Switch to call block and seal it
-        self.builder.switch_to_block(call_block);
-        self.builder.seal_block(call_block);
-        
-        // First evaluate the function prefix to get the function pointer
         let func_val = match &call.prefix {
             Expression::Field(table, field) => {
                 let table_val = self.translate_expr(table);
-                
-                // Create string constant for field name
+
                 let data_name = format!("str_{}", self.string_counter);
                 self.string_counter += 1;
                 let data_id = self.declare_global(&data_name, Some(field.as_bytes()));
                 let local_id = self.module.declare_data_in_func(data_id, self.builder.func);
                 let field_ptr = self.builder.ins().symbol_value(self.int, local_id);
 
-                // Get the function value using lua_gettable
                 let mut sig = self.module.make_signature();
                 sig.params.push(AbiParam::new(self.int));
                 sig.params.push(AbiParam::new(self.int));
                 sig.returns.push(AbiParam::new(self.int));
-                
+
                 let func_id = self.module
                     .declare_function("lua_gettable", Linkage::Import, &sig)
                     .expect("Failed to declare gettable helper function");
@@ -830,31 +994,209 @@ impl Translator<'_> {
             _ => self.translate_expr(&call.prefix),
         };
 
-        // Evaluate all arguments
         let args: Vec<_> = call.args.iter()
             .map(|arg| self.translate_expr(arg))
             .collect();
 
-        // Create signature for function call
         let mut sig = self.module.make_signature();
         for _ in 0..args.len() {
             sig.params.push(AbiParam::new(self.int));
         }
         sig.returns.push(AbiParam::new(self.int));
 
-        // Create an indirect call
         let sig_ref = self.builder.import_signature(sig);
         let call_inst = self.builder.ins().call_indirect(sig_ref, func_val, &args);
-        let result = self.builder.inst_results(call_inst)[0];
+        self.builder.inst_results(call_inst)[0]
+    }
+    fn debug_block_state(&self, location: &str) {
+        eprintln!("Debug: Block state at {}", location);
+        eprintln!("  Is unreachable: {}", self.builder.is_unreachable());
+        // Add any other relevant state information
+    }
+}
+
+/// The BlockManager tracks all created blocks and ensures they are properly sealed.
+/// Sealed blocks are tracked by their unique block index (converted to u32).
+pub struct BlockManager {
+    /// All blocks created so far.
+    block_stack: Vec<Block>,
+    /// Blocks that have been sealed (tracked by the block's index as a u32).
+    sealed_blocks: HashSet<u32>,
+    /// The block currently "open" for emitting instructions.
+    current_block: Option<Block>,
+    int: Type,
+}
+
+impl BlockManager {
+    pub fn new(int_type: Type) -> Self {
+        Self {
+            block_stack: Vec::new(),
+            sealed_blocks: HashSet::new(),
+            current_block: None,
+            int: int_type,
+        }
+    }
+
+    /// Create a new block.
+    pub fn create_block(&mut self, builder: &mut FunctionBuilder) -> Block {
+        let block = builder.create_block();
+        block
+    }
+
+    /// Switch to a new block.
+    ///
+    /// If there is a current block that is not terminated, an unconditional jump is
+    /// inserted (with zero-valued parameters) and that block is sealed. Then the builder
+    /// is switched to the new block.
+    pub fn switch_to_block(&mut self, builder: &mut FunctionBuilder, new_block: Block) {
+        // Handle current block if it exists and isn't sealed
+        if let Some(curr) = self.current_block {
+            if !self.sealed_blocks.contains(&(curr.index() as u32)) {
+                if !self.is_block_terminated(builder, curr) {
+                    let param_types: Vec<Type> = builder.func.dfg.block_params(new_block)
+                        .iter()
+                        .map(|&v| builder.func.dfg.value_type(v))
+                        .collect();
+                    let params: Vec<Value> = param_types
+                        .iter()
+                        .map(|&ty| {
+                            if ty.is_int() {
+                                builder.ins().iconst(ty, 0)
+                            } else if ty.is_float() {
+                                builder.ins().f64const(0.0)
+                            } else {
+                                panic!(
+                                    "Unsupported block parameter type in switch_to_block: {:?}",
+                                    ty
+                                );
+                            }
+                        })
+                        .collect();
+                    builder.ins().jump(new_block, &params);
+                }
+                builder.seal_block(curr);
+                eprintln!("BlockManager: Sealed current block {:?}", curr);
+                self.sealed_blocks.insert(curr.index() as u32);
+            }
+            // Clear current_block before switching
+            self.current_block = None;
+        }
+
+        eprintln!("BlockManager: Switching to new block {:?}", new_block);
+        builder.switch_to_block(new_block);
+        self.current_block = Some(new_block);
+        if !self.block_stack.contains(&new_block) {
+            self.block_stack.push(new_block);
+            eprintln!("BlockManager: Pushed new block {:?}", new_block);
+        }
+    }
+
+    /// Seal the given block.
+    ///
+    /// If the block is the current one and not terminated, a default return is inserted.
+    /// If it is already sealed (by its index), nothing more is done.
+    pub fn seal(&mut self, builder: &mut FunctionBuilder, block: Block) {
+        eprintln!("BlockManager: Sealing block {:?}", block);
+        if self.sealed_blocks.contains(&(block.index() as u32)) {
+            eprintln!("BlockManager: Block {:?} already sealed", block);
+            return;
+        }
         
-        // Jump to result block with the function result
-        self.builder.ins().jump(result_block, &[result]);
+        // If this is the current block and it's not terminated, add a return
+        if self.current_block == Some(block) && !self.is_block_terminated(builder, block) {
+            let ret_val = builder.ins().iconst(self.int, 0);
+            builder.ins().return_(&[ret_val]);
+        }
         
-        // Switch to result block and seal it
-        self.builder.switch_to_block(result_block);
-        self.builder.seal_block(result_block);
+        builder.seal_block(block);
+        eprintln!("BlockManager: Block {:?} sealed", block);
+        self.sealed_blocks.insert(block.index() as u32);
         
-        // Return the result from the phi
-        self.builder.block_params(result_block)[0]
+        // Clear current_block if we just sealed it
+        if self.current_block == Some(block) {
+            eprintln!("BlockManager: Clearing current block after sealing");
+            self.current_block = None;
+        }
+    }
+
+    /// Insert an unconditional jump from the current block to the target block,
+    /// then seal the current block.
+    pub fn jump_to_block(&mut self, builder: &mut FunctionBuilder, target: Block) {
+        if let Some(curr) = self.current_block {
+            if !self.sealed_blocks.contains(&(curr.index() as u32)) {
+                eprintln!(
+                    "BlockManager: Jumping from current block {:?} to target block {:?}",
+                    curr, target
+                );
+                if !self.is_block_terminated(builder, curr) {
+                    let param_types: Vec<Type> = builder
+                        .func
+                        .dfg
+                        .block_params(target)
+                        .iter()
+                        .map(|&v| builder.func.dfg.value_type(v))
+                        .collect();
+                    let args: Vec<Value> = param_types
+                        .iter()
+                        .map(|&ty| {
+                            if ty.is_int() {
+                                builder.ins().iconst(ty, 0)
+                            } else if ty.is_float() {
+                                builder.ins().f64const(0.0)
+                            } else {
+                                panic!(
+                                    "Unsupported block parameter type in jump_to_block: {:?}",
+                                    ty
+                                );
+                            }
+                        })
+                        .collect();
+                    eprintln!("BlockManager: Inserting jump with args {:?}", args);
+                    builder.ins().jump(target, &args);
+                }
+                builder.seal_block(curr);
+                eprintln!("BlockManager: Sealed current block {:?}", curr);
+                self.sealed_blocks.insert(curr.index() as u32);
+            }
+            // Clear current_block now that we've finished with it
+            self.current_block = None;
+        }
+    }
+
+    /// Finalize all pending blocks by sealing any that are not yet sealed.
+    pub fn finalize_blocks(&mut self, builder: &mut FunctionBuilder) {
+        eprintln!(
+            "BlockManager: Finalizing blocks, block_stack = {:?}",
+            self.block_stack
+        );
+        for block in self.block_stack.clone() {
+            if !self.sealed_blocks.contains(&(block.index() as u32)) {
+                eprintln!("BlockManager: Finalizing block {:?}", block);
+                self.seal(builder, block);
+            }
+        }
+        self.block_stack.clear();
+        self.current_block = None;
+        self.sealed_blocks.clear();
+        eprintln!("BlockManager: Finalization complete");
+    }
+
+    /// Check whether a given block is terminated (i.e. its last instruction is a terminator).
+    pub fn is_block_terminated(&self, builder: &FunctionBuilder, block: Block) -> bool {
+        if let Some(inst) = builder.func.layout.last_inst(block) {
+            builder.func.dfg.insts[inst].opcode().is_terminator()
+        } else {
+            false
+        }
+    }
+
+    /// Return the current block (if any).
+    pub fn get_current_block(&self) -> Option<Block> {
+        self.current_block
+    }
+
+    /// Check if a block is already inserted in the layout.
+    pub fn is_block_inserted(&self, builder: &FunctionBuilder, block: Block) -> bool {
+        builder.func.layout.is_block_inserted(block)
     }
 }
